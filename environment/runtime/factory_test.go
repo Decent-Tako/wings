@@ -37,10 +37,7 @@ func TestFactoryForRejectsUnsupportedRuntime(t *testing.T) {
 	}
 }
 
-func TestSelectedFactorySnapshotsFirstRuntime(t *testing.T) {
-	resetSelectedFactoryForTest()
-	t.Cleanup(resetSelectedFactoryForTest)
-
+func TestSelectedFactoryResolvesCurrentRuntime(t *testing.T) {
 	cfg, err := config.NewAtPath("/tmp/wings.yml")
 	if err != nil {
 		t.Fatalf("failed to create config: %v", err)
@@ -61,7 +58,7 @@ func TestSelectedFactorySnapshotsFirstRuntime(t *testing.T) {
 		t.Fatalf("SelectedFactory() after config update returned error: %v", err)
 	}
 
-	if reflect.TypeOf(first) != reflect.TypeOf(second) {
-		t.Fatalf("expected selected factory to be snapshotted, got %T then %T", first, second)
+	if reflect.TypeOf(first) == reflect.TypeOf(second) {
+		t.Fatalf("expected selected factory to resolve current runtime, got %T then %T", first, second)
 	}
 }

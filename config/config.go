@@ -358,7 +358,8 @@ type Configuration struct {
 
 	// ContainerRuntime selects which container runtime backend should be used
 	// for server process environments. Docker remains the default for existing
-	// installations.
+	// installations. The runtime is fixed at Wings startup; change this value
+	// on disk and restart Wings to switch backends.
 	ContainerRuntime ContainerRuntime        `default:"docker" json:"container_runtime" yaml:"container_runtime"`
 	Containerd       ContainerdConfiguration `json:"containerd" yaml:"containerd"`
 
