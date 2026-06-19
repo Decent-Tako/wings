@@ -34,6 +34,7 @@ func NewInstaller() (*Installer, error) {
 }
 
 func (i *Installer) PullImage(ctx context.Context, image string) error {
+	ctx = WithNamespace(ctx)
 	_, err := ensureContainerdImage(ctx, i.client, image, nil)
 	return err
 }

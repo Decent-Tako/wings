@@ -21,6 +21,7 @@ import (
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
@@ -115,6 +116,10 @@ func TestCreateRejectsUnsupportedContainerdNetworking(t *testing.T) {
 }
 
 func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
 	cli := &fakeClient{
 		pullErr:  io.ErrUnexpectedEOF,
 		getImage: fakeImage{name: "example.com/server:latest"},
@@ -129,6 +134,9 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 	}
 	if cli.pullRef == "" || cli.getRef == "" {
 		t.Fatalf("expected both Pull and GetImage to be attempted, pull=%q get=%q", cli.pullRef, cli.getRef)
+	}
+	if cli.pullNamespace != "test-pelican" || cli.getNamespace != "test-pelican" {
+		t.Fatalf("expected Pull and fallback GetImage to use namespace test-pelican, pull=%q get=%q", cli.pullNamespace, cli.getNamespace)
 	}
 }
 
@@ -442,6 +450,9 @@ func TestWaitForStopTerminatesSlowExitWhenRequested(t *testing.T) {
 
 func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
 	spec := newContainerdTestInstallationSpec(t)
 	cli := &fakeClient{
 		loadErr:         errdefs.ErrNotFound,
@@ -457,6 +468,64 @@ func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	}
 	if len(cli.snapshotter.removed) != 1 || cli.snapshotter.removed[0] != spec.ID+"-rootfs" {
 		t.Fatalf("expected installer snapshot %q to be removed, got %v", spec.ID+"-rootfs", cli.snapshotter.removed)
+	}
+	if len(cli.snapshotter.removeNamespaces) != 1 || cli.snapshotter.removeNamespaces[0] != "test-pelican" {
+		t.Fatalf("expected installer snapshot cleanup to use namespace test-pelican, got %v", cli.snapshotter.removeNamespaces)
+	}
+}
+
+func TestInstallerPullImageUsesConfiguredNamespace(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
+	cli := &fakeClient{
+		pullImage: fakeImage{name: "example.com/installer:latest"},
+	}
+	installer := &Installer{client: cli}
+
+	if err := installer.PullImage(context.Background(), "example.com/installer:latest"); err != nil {
+		t.Fatalf("PullImage() returned error: %v", err)
+	}
+	if cli.pullNamespace != "test-pelican" {
+		t.Fatalf("expected installer pull to use namespace test-pelican, got %q", cli.pullNamespace)
+	}
+}
+
+func TestInstallerExecuteUsesConfiguredNamespace(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
+	spec := newContainerdTestInstallationSpec(t)
+	task := &fakeTask{waitCh: make(chan containerdclient.ExitStatus, 1)}
+	task.waitCh <- *containerdclient.NewExitStatus(0, time.Now(), nil)
+	container := &fakeContainer{
+		id:      spec.ID,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli := &fakeClient{
+		container: container,
+		getImage:  fakeImage{name: spec.Image},
+	}
+	installer := &Installer{client: cli}
+
+	if _, err := installer.Execute(context.Background(), spec, func([]byte) {}); err != nil {
+		t.Fatalf("Execute() returned error: %v", err)
+	}
+
+	for name, namespace := range map[string]string{
+		"GetImage":     cli.getNamespace,
+		"NewContainer": cli.newContainerNamespace,
+		"NewTask":      container.newTaskNamespace,
+		"Wait":         task.waitNamespace,
+		"Start":        task.startNamespace,
+		"Delete":       task.deleteNamespace,
+	} {
+		if namespace != "test-pelican" {
+			t.Fatalf("expected installer %s to use namespace test-pelican, got %q", name, namespace)
+		}
 	}
 }
 
@@ -743,20 +812,24 @@ func waitForContainerdState(t *testing.T, env *Environment, state string, timeou
 }
 
 type fakeClient struct {
-	container containerdclient.Container
-	loadErr   error
+	container     containerdclient.Container
+	loadErr       error
+	loadNamespace string
 
-	newContainerID   string
-	newContainerOpts []containerdclient.NewContainerOpts
-	newContainerErr  error
+	newContainerID        string
+	newContainerOpts      []containerdclient.NewContainerOpts
+	newContainerErr       error
+	newContainerNamespace string
 
-	getRef   string
-	getImage containerdclient.Image
-	getErr   error
+	getRef       string
+	getImage     containerdclient.Image
+	getErr       error
+	getNamespace string
 
-	pullRef   string
-	pullImage containerdclient.Image
-	pullErr   error
+	pullRef       string
+	pullImage     containerdclient.Image
+	pullErr       error
+	pullNamespace string
 
 	events chan *ctrevents.Envelope
 	errs   chan error
@@ -764,16 +837,18 @@ type fakeClient struct {
 	snapshotter *fakeSnapshotter
 }
 
-func (f *fakeClient) LoadContainer(context.Context, string) (containerdclient.Container, error) {
+func (f *fakeClient) LoadContainer(ctx context.Context, _ string) (containerdclient.Container, error) {
+	f.loadNamespace = testContainerdNamespace(ctx)
 	if f.loadErr != nil {
 		return nil, f.loadErr
 	}
 	return f.container, nil
 }
 
-func (f *fakeClient) NewContainer(_ context.Context, id string, opts ...containerdclient.NewContainerOpts) (containerdclient.Container, error) {
+func (f *fakeClient) NewContainer(ctx context.Context, id string, opts ...containerdclient.NewContainerOpts) (containerdclient.Container, error) {
 	f.newContainerID = id
 	f.newContainerOpts = opts
+	f.newContainerNamespace = testContainerdNamespace(ctx)
 	if f.newContainerErr != nil {
 		return nil, f.newContainerErr
 	}
@@ -784,8 +859,9 @@ func (f *fakeClient) NewContainer(_ context.Context, id string, opts ...containe
 	return f.container, nil
 }
 
-func (f *fakeClient) GetImage(_ context.Context, ref string) (containerdclient.Image, error) {
+func (f *fakeClient) GetImage(ctx context.Context, ref string) (containerdclient.Image, error) {
 	f.getRef = ref
+	f.getNamespace = testContainerdNamespace(ctx)
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -795,8 +871,9 @@ func (f *fakeClient) GetImage(_ context.Context, ref string) (containerdclient.I
 	return nil, errdefs.ErrNotFound
 }
 
-func (f *fakeClient) Pull(_ context.Context, ref string, _ ...containerdclient.RemoteOpt) (containerdclient.Image, error) {
+func (f *fakeClient) Pull(ctx context.Context, ref string, _ ...containerdclient.RemoteOpt) (containerdclient.Image, error) {
 	f.pullRef = ref
+	f.pullNamespace = testContainerdNamespace(ctx)
 	if f.pullErr != nil {
 		return nil, f.pullErr
 	}
@@ -826,15 +903,18 @@ func (f *fakeClient) SnapshotService(string) snapshots.Snapshotter {
 type fakeContainer struct {
 	id string
 
-	task    containerdclient.Task
-	taskErr error
+	task          containerdclient.Task
+	taskErr       error
+	taskNamespace string
 
-	newTask    containerdclient.Task
-	newTaskErr error
+	newTask          containerdclient.Task
+	newTaskErr       error
+	newTaskNamespace string
 
-	labels    map[string]string
-	deleteErr error
-	deleted   bool
+	labels          map[string]string
+	deleteErr       error
+	deleted         bool
+	deleteNamespace string
 }
 
 func (f *fakeContainer) ID() string { return f.id }
@@ -843,12 +923,14 @@ func (f *fakeContainer) Info(context.Context, ...containerdclient.InfoOpts) (con
 	return containerdcontainers.Container{ID: f.id, Labels: f.labels}, nil
 }
 
-func (f *fakeContainer) Delete(context.Context, ...containerdclient.DeleteOpts) error {
+func (f *fakeContainer) Delete(ctx context.Context, _ ...containerdclient.DeleteOpts) error {
 	f.deleted = true
+	f.deleteNamespace = testContainerdNamespace(ctx)
 	return f.deleteErr
 }
 
-func (f *fakeContainer) NewTask(context.Context, cio.Creator, ...containerdclient.NewTaskOpts) (containerdclient.Task, error) {
+func (f *fakeContainer) NewTask(ctx context.Context, _ cio.Creator, _ ...containerdclient.NewTaskOpts) (containerdclient.Task, error) {
+	f.newTaskNamespace = testContainerdNamespace(ctx)
 	if f.newTaskErr != nil {
 		return nil, f.newTaskErr
 	}
@@ -862,7 +944,8 @@ func (f *fakeContainer) NewTask(context.Context, cio.Creator, ...containerdclien
 
 func (f *fakeContainer) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
 
-func (f *fakeContainer) Task(context.Context, cio.Attach) (containerdclient.Task, error) {
+func (f *fakeContainer) Task(ctx context.Context, _ cio.Attach) (containerdclient.Task, error) {
+	f.taskNamespace = testContainerdNamespace(ctx)
 	if f.taskErr != nil {
 		return nil, f.taskErr
 	}
@@ -914,6 +997,7 @@ type fakeTask struct {
 
 	waitCh              chan containerdclient.ExitStatus
 	waitCtx             context.Context
+	waitNamespace       string
 	waitErr             error
 	waitOnContextCancel bool
 	exitOnStart         bool
@@ -921,20 +1005,23 @@ type fakeTask struct {
 	metric    *apitypes.Metric
 	metricErr error
 
-	startCalls  int
-	startErr    error
-	deleteCalls int
-	deleteErr   error
-	killed      []syscall.Signal
-	killErr     error
+	startCalls      int
+	startNamespace  string
+	startErr        error
+	deleteCalls     int
+	deleteNamespace string
+	deleteErr       error
+	killed          []syscall.Signal
+	killErr         error
 }
 
 func (f *fakeTask) ID() string { return "test-server" }
 
 func (f *fakeTask) Pid() uint32 { return 1234 }
 
-func (f *fakeTask) Start(context.Context) error {
+func (f *fakeTask) Start(ctx context.Context) error {
 	f.startCalls++
+	f.startNamespace = testContainerdNamespace(ctx)
 	if f.startErr != nil {
 		return f.startErr
 	}
@@ -951,8 +1038,9 @@ func (f *fakeTask) Start(context.Context) error {
 	return nil
 }
 
-func (f *fakeTask) Delete(context.Context, ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
+func (f *fakeTask) Delete(ctx context.Context, _ ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
 	f.deleteCalls++
+	f.deleteNamespace = testContainerdNamespace(ctx)
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
 	}
@@ -971,6 +1059,7 @@ func (f *fakeTask) Kill(_ context.Context, signal syscall.Signal, _ ...container
 
 func (f *fakeTask) Wait(ctx context.Context) (<-chan containerdclient.ExitStatus, error) {
 	f.waitCtx = ctx
+	f.waitNamespace = testContainerdNamespace(ctx)
 	if f.waitErr != nil {
 		return nil, f.waitErr
 	}
@@ -1065,8 +1154,9 @@ func (f fakeImage) Platform() platforms.MatchComparer { return nil }
 func (f fakeImage) Spec(context.Context) (ocispec.Image, error) { return ocispec.Image{}, nil }
 
 type fakeSnapshotter struct {
-	removed   []string
-	removeErr error
+	removed          []string
+	removeNamespaces []string
+	removeErr        error
 }
 
 func (f *fakeSnapshotter) Stat(context.Context, string) (snapshots.Info, error) {
@@ -1097,8 +1187,9 @@ func (f *fakeSnapshotter) Commit(context.Context, string, string, ...snapshots.O
 	return errdefs.ErrNotImplemented
 }
 
-func (f *fakeSnapshotter) Remove(_ context.Context, key string) error {
+func (f *fakeSnapshotter) Remove(ctx context.Context, key string) error {
 	f.removed = append(f.removed, key)
+	f.removeNamespaces = append(f.removeNamespaces, testContainerdNamespace(ctx))
 	return f.removeErr
 }
 
@@ -1116,3 +1207,8 @@ var _ containerdclient.Container = (*fakeContainer)(nil)
 var _ containerdclient.Task = (*fakeTask)(nil)
 var _ containerdclient.Image = (*fakeImage)(nil)
 var _ snapshots.Snapshotter = (*fakeSnapshotter)(nil)
+
+func testContainerdNamespace(ctx context.Context) string {
+	namespace, _ := namespaces.Namespace(ctx)
+	return namespace
+}

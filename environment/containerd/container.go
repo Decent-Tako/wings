@@ -132,6 +132,7 @@ func (e *Environment) ensureImageExists(ctx context.Context) (containerdclient.I
 }
 
 func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, publish func(string, string)) (containerdclient.Image, error) {
+	ctx = WithNamespace(ctx)
 	ref := strings.TrimPrefix(image, "~")
 	pullCtx, cancel := imagePullContext(ctx)
 	defer cancel()
