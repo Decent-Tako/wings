@@ -205,14 +205,14 @@ func (e *Environment) validateHostNetworkingOnly() error {
 	mode := config.Get().Containerd.Network.Mode
 	// TODO(T5): replace this guard with CNI/portmap configuration reconciliation
 	// when containerd networking supports Wings' Docker bridge behavior.
+	if mode == "macvlan" {
+		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: macvlan requires the later CNI implementation")
+	}
 	if mode != "host" {
 		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set containerd.network.mode to %q until the later CNI/portmap implementation lands", "host")
 	}
 	if allocations.ForceOutgoingIP {
 		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: force_outgoing_ip requires the later CNI/SNAT implementation")
-	}
-	if mode == "macvlan" {
-		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: macvlan requires the later CNI implementation")
 	}
 	return nil
 }
