@@ -185,6 +185,9 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 
 func (e *Environment) validateHostNetworkingOnly() error {
 	allocations := e.Configuration.Allocations()
+	if config.Get().Docker.Network.Mode != "host" {
+		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set docker.network.network_mode to %q until the later CNI/portmap implementation lands", "host")
+	}
 	if allocations.ForceOutgoingIP {
 		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: force_outgoing_ip requires the later CNI/SNAT implementation")
 	}

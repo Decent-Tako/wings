@@ -49,7 +49,7 @@ func (e *Environment) pollResources(ctx context.Context) error {
 				Memory:      memory,
 				MemoryLimit: e.configuredMemoryLimit(),
 				CpuAbsolute: calculateCPUPercent(previousCPU, cpuUsage, previousRead, now),
-				Network:     environment.NetworkStats{},
+				Network:     unsupportedNetworkStats(),
 			}
 
 			previousCPU = cpuUsage
@@ -57,6 +57,12 @@ func (e *Environment) pollResources(ctx context.Context) error {
 			e.Events().Publish(environment.ResourceEvent, stats)
 		}
 	}
+}
+
+func unsupportedNetworkStats() environment.NetworkStats {
+	// TODO(T5): collect RX/TX from the container netns once the CNI/portmap
+	// implementation replaces the current host-network-only containerd backend.
+	return environment.NetworkStats{}
 }
 
 func (e *Environment) uptimeMilliseconds(now time.Time) int64 {
