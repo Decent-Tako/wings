@@ -83,8 +83,10 @@ func (e *Environment) Attach(ctx context.Context) error {
 	// Register Wait before Start. Start() creates a new task through Attach(),
 	// then starts that same task after Attach returns; registering the wait
 	// channel here makes immediate exits observable instead of racing startup.
-	exitC, err := task.Wait(e.context(ctx))
+	waitCtx, waitStop := context.WithCancel(context.Background())
+	exitC, err := task.Wait(e.context(waitCtx))
 	if err != nil {
+		waitStop()
 		if createdTask {
 			if _, cleanupErr := task.Delete(e.context(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
 				warnContainerdCleanupError(e.log(), cleanupErr, "failed to delete containerd task after attach wait error")
@@ -105,12 +107,13 @@ func (e *Environment) Attach(ctx context.Context) error {
 	e.taskIO = task.IO()
 	e.stdin = stdinW
 	e.stdout = stdoutW
+	e.waitStop = waitStop
 	e.pollStop = pollStop
 	e.oomStop = oomStop
 	e.mu.Unlock()
 
 	go e.consumeOutput(stdoutR, logWriter)
-	go e.watchExit(exitC, task)
+	go e.watchExit(waitCtx, exitC, task)
 	go e.watchOOM(oomCtx)
 	go func() {
 		if err := e.pollResources(pollCtx); err != nil && !errors.Is(err, context.Canceled) {
@@ -179,7 +182,7 @@ func (e *Environment) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClo
 	}
 }
 
-func (e *Environment) watchExit(exitC <-chan containerdclient.ExitStatus, task containerdclient.Task) {
+func (e *Environment) watchExit(waitCtx context.Context, exitC <-chan containerdclient.ExitStatus, task containerdclient.Task) {
 	status, ok := <-exitC
 	if !ok {
 		return
@@ -187,6 +190,9 @@ func (e *Environment) watchExit(exitC <-chan containerdclient.ExitStatus, task c
 
 	code, exitedAt, err := status.Result()
 	if err != nil {
+		if waitCtx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		e.log().WithField("error", err).Warn("containerd task exited with error status")
 	}
 
@@ -207,16 +213,21 @@ func (e *Environment) closeAttach() {
 	stdin := e.stdin
 	stdout := e.stdout
 	taskIO := e.taskIO
+	waitStop := e.waitStop
 	pollStop := e.pollStop
 	oomStop := e.oomStop
 	e.stdin = nil
 	e.stdout = nil
 	e.taskIO = nil
 	e.task = nil
+	e.waitStop = nil
 	e.pollStop = nil
 	e.oomStop = nil
 	e.mu.Unlock()
 
+	if waitStop != nil {
+		waitStop()
+	}
 	if pollStop != nil {
 		pollStop()
 	}

@@ -47,6 +47,7 @@ type Environment struct {
 	taskIO    cio.IO
 	stdin     *io.PipeWriter
 	stdout    *io.PipeWriter
+	waitStop  context.CancelFunc
 	pollStop  context.CancelFunc
 	oomStop   context.CancelFunc
 	startedAt time.Time

@@ -216,6 +216,59 @@ func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
 	}
 }
 
+func TestStartKeepsTaskWaitAliveAfterAttachContextCanceled(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{waitOnContextCancel: true}
+	container := &fakeContainer{
+		id:      env.Id,
+		taskErr: errdefs.ErrNotFound,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli.loadErr = errdefs.ErrNotFound
+	cli.container = container
+
+	if err := env.Start(context.Background()); err != nil {
+		t.Fatalf("Start() returned error: %v", err)
+	}
+	defer env.closeAttach()
+
+	if task.waitCtx == nil {
+		t.Fatal("expected Attach to register task Wait")
+	}
+	if err := task.waitCtx.Err(); err != nil {
+		t.Fatalf("expected task Wait context to survive Start attach timeout cancellation, got %v", err)
+	}
+	if !env.IsAttached() {
+		t.Fatal("expected environment to remain attached after successful Start")
+	}
+}
+
+func TestWatchExitIgnoresCanceledWaitContext(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running}
+	attachContainerdTestStdin(t, env)
+	env.SetState(environment.ProcessRunningState)
+
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	exitC := make(chan containerdclient.ExitStatus, 1)
+	exitC <- *containerdclient.NewExitStatus(0, time.Now(), context.Canceled)
+	close(exitC)
+
+	env.watchExit(waitCtx, exitC, task)
+
+	if task.deleteCalls != 0 {
+		t.Fatalf("expected canceled wait not to delete the running task, got %d deletes", task.deleteCalls)
+	}
+	if !env.IsAttached() {
+		t.Fatal("expected canceled wait not to close attach state")
+	}
+	if env.State() != environment.ProcessRunningState {
+		t.Fatalf("expected canceled wait not to mark server offline, got %q", env.State())
+	}
+}
+
 func TestStartReattachesRunningTaskAndRestoresStartedAt(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	startedAt := time.Now().Add(-2 * time.Minute).UTC()
@@ -831,9 +884,11 @@ func (f *fakeContainer) Restore(context.Context, cio.Creator, string) (int, erro
 type fakeTask struct {
 	status containerdclient.ProcessStatus
 
-	waitCh      chan containerdclient.ExitStatus
-	waitErr     error
-	exitOnStart bool
+	waitCh              chan containerdclient.ExitStatus
+	waitCtx             context.Context
+	waitErr             error
+	waitOnContextCancel bool
+	exitOnStart         bool
 
 	metric    *apitypes.Metric
 	metricErr error
@@ -886,12 +941,20 @@ func (f *fakeTask) Kill(_ context.Context, signal syscall.Signal, _ ...container
 	return nil
 }
 
-func (f *fakeTask) Wait(context.Context) (<-chan containerdclient.ExitStatus, error) {
+func (f *fakeTask) Wait(ctx context.Context) (<-chan containerdclient.ExitStatus, error) {
+	f.waitCtx = ctx
 	if f.waitErr != nil {
 		return nil, f.waitErr
 	}
 	if f.waitCh == nil {
 		f.waitCh = make(chan containerdclient.ExitStatus)
+	}
+	if f.waitOnContextCancel {
+		go func(ch chan containerdclient.ExitStatus) {
+			<-ctx.Done()
+			ch <- *containerdclient.NewExitStatus(0, time.Now(), ctx.Err())
+			close(ch)
+		}(f.waitCh)
 	}
 	return f.waitCh, nil
 }
