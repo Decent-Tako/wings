@@ -185,6 +185,8 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 
 func (e *Environment) validateHostNetworkingOnly() error {
 	allocations := e.Configuration.Allocations()
+	// TODO(T5): replace this guard with CNI/portmap configuration reconciliation
+	// when containerd networking supports Wings' Docker bridge behavior.
 	if config.Get().Docker.Network.Mode != "host" {
 		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set docker.network.network_mode to %q until the later CNI/portmap implementation lands", "host")
 	}
