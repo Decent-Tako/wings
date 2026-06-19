@@ -45,6 +45,10 @@ func (Factory) NewProcess(id string, meta environment.ProcessMetadata, cfg *envi
 	return New(id, meta, cfg, cli), nil
 }
 
+func (Factory) NewInstaller() (environment.InstallationRunner, error) {
+	return NewInstaller()
+}
+
 func Client() (*containerdclient.Client, error) {
 	clientOnce.Do(func() {
 		client, clientErr = containerdclient.New(config.Get().Containerd.Address)

@@ -1,29 +1,20 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"html/template"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/apex/log"
-	"github.com/docker/docker/api/types/container"
-	dockerImage "github.com/docker/docker/api/types/image"
-
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/parsers/kernel"
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	envruntime "github.com/pelican-dev/wings/environment/runtime"
 	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/system"
 )
@@ -120,7 +111,7 @@ func (s *Server) internalInstall() error {
 type InstallationProcess struct {
 	Server *Server
 	Script *remote.InstallationScript
-	client *client.Client
+	runner environment.InstallationRunner
 }
 
 // NewInstallationProcess returns a new installation process struct that will be
@@ -132,10 +123,10 @@ func NewInstallationProcess(s *Server, script *remote.InstallationScript) (*Inst
 		Server: s,
 	}
 
-	if c, err := environment.Docker(); err != nil {
+	if runner, err := envruntime.NewInstaller(); err != nil {
 		return nil, err
 	} else {
-		proc.client = c
+		proc.runner = runner
 	}
 
 	return proc, nil
@@ -165,14 +156,7 @@ func (s *Server) SetRestoring(state bool) {
 
 // RemoveContainer removes the installation container for the server.
 func (ip *InstallationProcess) RemoveContainer() error {
-	err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", container.RemoveOptions{
-		RemoveVolumes: true,
-		Force:         true,
-	})
-	if err != nil && !client.IsErrNotFound(err) {
-		return err
-	}
-	return nil
+	return ip.runner.Remove(ip.Server.Context(), ip.installerID())
 }
 
 // Run runs the installation process, this is done as in a background thread.
@@ -217,6 +201,10 @@ func (ip *InstallationProcess) tempDir() string {
 	return filepath.Join(config.Get().System.TmpDirectory, ip.Server.ID())
 }
 
+func (ip *InstallationProcess) installerID() string {
+	return ip.Server.ID() + "_installer"
+}
+
 // Writes the installation script to a temporary file on the host machine so that it
 // can be properly mounted into the installation container and then executed.
 func (ip *InstallationProcess) writeScriptToDisk() error {
@@ -236,77 +224,6 @@ func (ip *InstallationProcess) writeScriptToDisk() error {
 	return nil
 }
 
-// Pulls the docker image to be used for the installation container.
-func (ip *InstallationProcess) pullInstallationImage() error {
-	// Get a registry auth configuration from the config.
-	var registryAuth *config.RegistryConfiguration
-	for registry, c := range config.Get().Docker.Registries {
-		if !strings.HasPrefix(ip.Script.ContainerImage, registry) {
-			continue
-		}
-
-		log.WithField("registry", registry).Debug("using authentication for registry")
-		registryAuth = &c
-		break
-	}
-
-	// Get the ImagePullOptions.
-	imagePullOptions := dockerImage.PullOptions{All: false, Platform: runtime.GOOS + "/" + runtime.GOARCH}
-	if registryAuth != nil {
-		b64, err := registryAuth.Base64()
-		if err != nil {
-			log.WithError(err).Error("failed to get registry auth credentials")
-		}
-
-		// b64 is a string so if there is an error it will just be empty, not nil.
-		imagePullOptions.RegistryAuth = b64
-	}
-
-	r, err := ip.client.ImagePull(ip.Server.Context(), ip.Script.ContainerImage, imagePullOptions)
-	if err != nil {
-		images, ierr := ip.client.ImageList(ip.Server.Context(), dockerImage.ListOptions{})
-		if ierr != nil {
-			// Well damn, something has gone really wrong here, just go ahead and abort there
-			// isn't much anything we can do to try and self-recover from this.
-			return ierr
-		}
-
-		for _, img := range images {
-			for _, t := range img.RepoTags {
-				if t != ip.Script.ContainerImage {
-					continue
-				}
-
-				log.WithFields(log.Fields{
-					"image": ip.Script.ContainerImage,
-					"err":   err.Error(),
-				}).Warn("unable to pull requested image from remote source, however the image exists locally")
-
-				// Okay, we found a matching container image, in that case just go ahead and return
-				// from this function, since there is nothing else we need to do here.
-				return nil
-			}
-		}
-
-		return err
-	}
-	defer r.Close()
-
-	log.WithField("image", ip.Script.ContainerImage).Debug("pulling docker image... this could take a bit of time")
-
-	// Block continuation until the image has been pulled successfully.
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		log.Debug(scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // BeforeExecute runs before the container is executed. This pulls down the
 // required docker container image as well as writes the installation script to
 // the disk. This process is executed in an async manner, if either one fails
@@ -315,7 +232,7 @@ func (ip *InstallationProcess) BeforeExecute() error {
 	if err := ip.writeScriptToDisk(); err != nil {
 		return errors.WithMessage(err, "failed to write installation script to disk")
 	}
-	if err := ip.pullInstallationImage(); err != nil {
+	if err := ip.runner.PullImage(ip.Server.Context(), ip.Script.ContainerImage); err != nil {
 		return errors.WithMessage(err, "failed to pull updated installation container image for server")
 	}
 	if err := ip.RemoveContainer(); err != nil {
@@ -336,15 +253,11 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 	defer ip.RemoveContainer()
 
 	ip.Server.Log().WithField("container_id", containerId).Debug("pulling installation logs for server")
-	reader, err := ip.client.ContainerLogs(ip.Server.Context(), containerId, container.LogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-		Follow:     false,
-	})
-
-	if err != nil && !client.IsErrNotFound(err) {
+	reader, err := ip.runner.Logs(ip.Server.Context(), containerId)
+	if err != nil {
 		return err
 	}
+	defer reader.Close()
 
 	// Get kernel version using the kernel package
 	v, err := kernel.GetKernelVersion()
@@ -407,7 +320,7 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 	return nil
 }
 
-// Execute executes the installation process inside a specially created docker
+// Execute executes the installation process inside a specially created runtime
 // container.
 func (ip *InstallationProcess) Execute() (string, error) {
 	// Create a child context that is canceled once this function is done running. This
@@ -415,49 +328,6 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// which occurs if the server is deleted.
 	ctx, cancel := context.WithCancel(ip.Server.Context())
 	defer cancel()
-
-	conf := &container.Config{
-		Hostname:     "installer",
-		AttachStdout: true,
-		AttachStderr: true,
-		AttachStdin:  true,
-		OpenStdin:    true,
-		Tty:          true,
-		Cmd:          []string{ip.Script.Entrypoint, "/mnt/install/install.sh"},
-		Image:        ip.Script.ContainerImage,
-		Env:          ip.Server.GetEnvironmentVariables(),
-		Labels: map[string]string{
-			"Service":       "Pelican",
-			"ContainerType": "server_installer",
-		},
-	}
-
-	cfg := config.Get()
-	tmpfsSize := strconv.Itoa(int(cfg.Docker.TmpfsSize))
-	hostConf := &container.HostConfig{
-		Mounts: []mount.Mount{
-			{
-				Target:   "/mnt/server",
-				Source:   ip.Server.Filesystem().Path(),
-				Type:     mount.TypeBind,
-				ReadOnly: false,
-			},
-			{
-				Target:   "/mnt/install",
-				Source:   ip.tempDir(),
-				Type:     mount.TypeBind,
-				ReadOnly: false,
-			},
-		},
-		Resources: ip.resourceLimits(),
-		Tmpfs: map[string]string{
-			"/tmp": "rw,exec,nosuid,size=" + tmpfsSize + "M",
-		},
-		DNS:         cfg.Docker.Network.Dns,
-		LogConfig:   cfg.Docker.ContainerLogConfig(),
-		NetworkMode: container.NetworkMode(cfg.Docker.Network.Mode),
-		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
-	}
 
 	// Ensure the root directory for the server exists properly before attempting
 	// to trigger the reinstall of the server. It is possible the directory would
@@ -477,77 +347,25 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		}
 	}()
 
-	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
-	var serverNetConfig = config.Get().Docker.Network
-	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
-		var defaultMapping = ip.Server.Config().Allocations.DefaultMapping
-		ip.Server.Log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
-		netConf = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				serverNetConfig.Name: { //Get network name from wings config
-					IPAMConfig: &network.EndpointIPAMConfig{
-						IPv4Address: defaultMapping.Ip,
-					},
-					IPAddress: defaultMapping.Ip, //Use default mapping ip address (wings support only one network per server)
-					Gateway:   serverNetConfig.Interfaces.V4.Gateway,
-				},
-			},
-		}
+	spec := environment.InstallationSpec{
+		ID:          ip.installerID(),
+		Image:       ip.Script.ContainerImage,
+		Entrypoint:  ip.Script.Entrypoint,
+		ScriptPath:  "/mnt/install/install.sh",
+		TempPath:    ip.tempDir(),
+		ServerPath:  ip.Server.Filesystem().Path(),
+		Env:         ip.Server.GetEnvironmentVariables(),
+		Limits:      ip.resourceLimits(),
+		Allocations: ip.Server.Config().Allocations,
 	}
-	// Pass the networkings configuration or nil if none required
-	r, err := ip.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, ip.Server.ID()+"_installer")
+
+	ip.Server.Events().Publish(DaemonMessageEvent, "Starting installation process, this could take a few minutes...")
+	id, err := ip.runner.Execute(ctx, spec, ip.Server.Sink(system.InstallSink).Push)
 	if err != nil {
 		return "", err
 	}
-
-	ip.Server.Log().WithField("container_id", r.ID).Info("running installation script for server in container")
-	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
-		return "", err
-	}
-
-	// Process the install event in the background by listening to the stream output until the
-	// container has stopped, at which point we'll disconnect from it.
-	//
-	// If there is an error during the streaming output just report it and do nothing else, the
-	// install can still run, the console just won't have any output.
-	go func(id string) {
-		ip.Server.Events().Publish(DaemonMessageEvent, "Starting installation process, this could take a few minutes...")
-		if err := ip.StreamOutput(ctx, id); err != nil {
-			ip.Server.Log().WithField("error", err).Warn("error connecting to server install stream output")
-		}
-	}(r.ID)
-
-	sChan, eChan := ip.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-eChan:
-		// Once the container has stopped running we can mark the install process as being completed.
-		if err == nil {
-			ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
-		} else {
-			return "", err
-		}
-	case <-sChan:
-	}
-
-	return r.ID, nil
-}
-
-// StreamOutput streams the output of the installation process to a log file in
-// the server configuration directory, as well as to a websocket listener so
-// that the process can be viewed in the panel by administrators.
-func (ip *InstallationProcess) StreamOutput(ctx context.Context, id string) error {
-	opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
-	reader, err := ip.client.ContainerLogs(ctx, id, opts)
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	err = system.ScanReader(reader, ip.Server.Sink(system.InstallSink).Push)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		ip.Server.Log().WithFields(log.Fields{"container_id": id, "error": err}).Warn("error processing install output lines")
-	}
-	return nil
+	ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
+	return id, nil
 }
 
 // resourceLimits returns resource limits for the installation container. This
@@ -559,7 +377,7 @@ func (ip *InstallationProcess) StreamOutput(ctx context.Context, id string) erro
 // This also avoids a server with limits such as 4GB of memory from accidentally
 // consuming 2-5x the defined limits during the install process and causing
 // system instability.
-func (ip *InstallationProcess) resourceLimits() container.Resources {
+func (ip *InstallationProcess) resourceLimits() environment.Limits {
 	limits := config.Get().Docker.InstallerLimits
 
 	// Create a copy of the configuration, so we're not accidentally making
@@ -578,13 +396,7 @@ func (ip *InstallationProcess) resourceLimits() container.Resources {
 		cfg.CpuLimit = limits.Cpu
 	}
 
-	resources := cfg.AsContainerResources()
-	// Explicitly remove the PID limits for the installation container. These scripts are
-	// defined at an administrative level and users can't manually execute things like a
-	// fork bomb during this process.
-	resources.PidsLimit = nil
-
-	return resources
+	return cfg
 }
 
 // SyncInstallState makes an HTTP request to the Panel instance notifying it that

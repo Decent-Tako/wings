@@ -18,3 +18,7 @@ func (Factory) NewProcess(id string, meta environment.ProcessMetadata, cfg *envi
 		Stop:  meta.Stop,
 	}, cfg)
 }
+
+func (Factory) NewInstaller() (environment.InstallationRunner, error) {
+	return NewInstaller()
+}

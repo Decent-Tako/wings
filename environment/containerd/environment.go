@@ -33,7 +33,7 @@ type Environment struct {
 	Configuration *environment.Configuration
 
 	meta   environment.ProcessMetadata
-	client *containerdclient.Client
+	client clientAPI
 
 	emitter *events.Bus
 	st      *system.AtomicString
@@ -53,7 +53,7 @@ type Environment struct {
 	lastOOM      bool
 }
 
-func New(id string, meta environment.ProcessMetadata, cfg *environment.Configuration, cli *containerdclient.Client) *Environment {
+func New(id string, meta environment.ProcessMetadata, cfg *environment.Configuration, cli clientAPI) *Environment {
 	return &Environment{
 		Id:            id,
 		Configuration: cfg,

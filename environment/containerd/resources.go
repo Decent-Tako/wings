@@ -13,6 +13,16 @@ var canSetBlockIOWeight = blockIOWeightSupported
 
 func resourceSpecOpts(l environment.Limits) []oci.SpecOpts {
 	resources := linuxResources(l)
+	return resourceSpecOptsFrom(resources)
+}
+
+func installerResourceSpecOpts(l environment.Limits) []oci.SpecOpts {
+	resources := linuxResources(l)
+	resources.Pids = nil
+	return resourceSpecOptsFrom(resources)
+}
+
+func resourceSpecOptsFrom(resources *specs.LinuxResources) []oci.SpecOpts {
 	opts := []oci.SpecOpts{}
 	if resources.Memory != nil {
 		if resources.Memory.Limit != nil {

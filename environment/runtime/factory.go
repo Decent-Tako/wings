@@ -13,6 +13,7 @@ import (
 type Factory interface {
 	Configure(ctx context.Context) error
 	NewProcess(id string, meta environment.ProcessMetadata, cfg *environment.Configuration) (environment.ProcessEnvironment, error)
+	NewInstaller() (environment.InstallationRunner, error)
 }
 
 func SelectedFactory() (Factory, error) {
@@ -44,4 +45,12 @@ func NewProcess(id string, meta environment.ProcessMetadata, cfg *environment.Co
 		return nil, err
 	}
 	return factory.NewProcess(id, meta, cfg)
+}
+
+func NewInstaller() (environment.InstallationRunner, error) {
+	factory, err := SelectedFactory()
+	if err != nil {
+		return nil, err
+	}
+	return factory.NewInstaller()
 }

@@ -111,12 +111,23 @@ func (e *Environment) InSituUpdate() error {
 }
 
 func (e *Environment) ensureImageExists(ctx context.Context) (containerdclient.Image, error) {
-	e.Events().Publish(environment.DockerImagePullStarted, "")
-	defer e.Events().Publish(environment.DockerImagePullCompleted, "")
+	return ensureContainerdImage(ctx, e.client, e.meta.Image, func(topic, data string) {
+		e.Events().Publish(topic, data)
+	})
+}
 
-	ref := strings.TrimPrefix(e.meta.Image, "~")
-	if strings.HasPrefix(e.meta.Image, "~") {
-		return e.client.GetImage(ctx, ref)
+func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, publish func(string, string)) (containerdclient.Image, error) {
+	ref := strings.TrimPrefix(image, "~")
+	pullCtx, cancel := imagePullContext(ctx)
+	defer cancel()
+
+	if strings.HasPrefix(image, "~") {
+		return cli.GetImage(pullCtx, ref)
+	}
+
+	if publish != nil {
+		publish(environment.DockerImagePullStarted, "")
+		defer publish(environment.DockerImagePullCompleted, "")
 	}
 
 	opts := []containerdclient.RemoteOpt{
@@ -124,29 +135,40 @@ func (e *Environment) ensureImageExists(ctx context.Context) (containerdclient.I
 		containerdclient.WithPullSnapshotter(config.Get().Containerd.Snapshotter),
 		containerdclient.WithPlatform(runtime.GOOS + "/" + runtime.GOARCH),
 	}
-	if opt, ok := e.registryResolverOpt(ref); ok {
+	if opt, ok := registryResolverOpt(ref); ok {
 		opts = append(opts, opt)
 	}
 
-	e.Events().Publish(environment.DockerImagePullStatus, "pulling "+ref)
-	image, err := e.client.Pull(ctx, ref, opts...)
+	if publish != nil {
+		publish(environment.DockerImagePullStatus, "pulling "+ref)
+	}
+	pulled, err := cli.Pull(pullCtx, ref, opts...)
 	if err != nil {
-		local, localErr := e.client.GetImage(ctx, ref)
+		local, localErr := cli.GetImage(pullCtx, ref)
 		if localErr == nil {
 			log.WithFields(log.Fields{
-				"image":        ref,
-				"container_id": e.Id,
-				"err":          err.Error(),
+				"image": ref,
+				"err":   err.Error(),
 			}).Warn("unable to pull requested image from remote source, however the image exists locally")
 			return local, nil
 		}
 		return nil, errors.Wrapf(err, "environment/containerd: failed to pull %q image for server", ref)
 	}
-	e.Events().Publish(environment.DockerImagePullStatus, "unpacked "+ref)
-	return image, nil
+	if publish != nil {
+		publish(environment.DockerImagePullStatus, "unpacked "+ref)
+	}
+	return pulled, nil
 }
 
-func (e *Environment) registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
+func imagePullContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := time.Duration(config.Get().Containerd.ImagePullTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 	for registry, credentials := range config.Get().Docker.Registries {
 		if !strings.HasPrefix(ref, registry) {
 			continue
