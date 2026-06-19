@@ -368,6 +368,8 @@ func (w *rotatingLogWriter) Close() error {
 }
 
 func (w *rotatingLogWriter) rotate() error {
+	// TODO(T5): make rotation crash-safe with fsync/generation metadata before
+	// increasing guarantees around concurrent Readlog during rotation.
 	if w.file != nil {
 		if err := w.file.Close(); err != nil {
 			return err

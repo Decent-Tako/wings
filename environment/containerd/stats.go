@@ -81,6 +81,8 @@ func (e *Environment) configuredMemoryLimit() uint64 {
 	return uint64(limit)
 }
 
+// TODO(T5): add a Docker/containerd golden or tolerance test for this absolute
+// CPU percentage path before changing the stats contract again.
 func calculateCPUPercent(previousUsage, currentUsage uint64, previousRead, currentRead time.Time) float64 {
 	if previousUsage == 0 || currentUsage <= previousUsage || previousRead.IsZero() {
 		return 0
