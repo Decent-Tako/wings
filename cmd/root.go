@@ -29,6 +29,7 @@ import (
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	envruntime "github.com/pelican-dev/wings/environment/runtime"
 	"github.com/pelican-dev/wings/internal/cron"
 	"github.com/pelican-dev/wings/internal/database"
 	"github.com/pelican-dev/wings/loggers/cli"
@@ -173,8 +174,8 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		return
 	}
 
-	if err := environment.ConfigureDocker(cmd.Context()); err != nil {
-		log.WithField("error", err).Fatal("failed to configure docker environment")
+	if err := envruntime.ConfigureSelected(cmd.Context()); err != nil {
+		log.WithField("error", err).Fatal("failed to configure container runtime environment")
 		return
 	}
 

@@ -356,6 +356,12 @@ type Configuration struct {
 	System SystemConfiguration `json:"system" yaml:"system"`
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
+	// ContainerRuntime selects which container runtime backend should be used
+	// for server process environments. Docker remains the default for existing
+	// installations.
+	ContainerRuntime ContainerRuntime        `default:"docker" json:"container_runtime" yaml:"container_runtime"`
+	Containerd       ContainerdConfiguration `json:"containerd" yaml:"containerd"`
+
 	// Defines internal throttling configurations for server processes to prevent
 	// someone from running an endless loop that spams data to logs.
 	Throttles ConsoleThrottles
