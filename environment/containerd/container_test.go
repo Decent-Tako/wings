@@ -372,6 +372,53 @@ func TestWaitForStopTerminatesSlowExitWhenRequested(t *testing.T) {
 	}
 }
 
+func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
+	newContainerdTestConfig(t)
+	spec := newContainerdTestInstallationSpec(t)
+	cli := &fakeClient{
+		loadErr:         errdefs.ErrNotFound,
+		getImage:        fakeImage{name: spec.Image},
+		newContainerErr: io.ErrUnexpectedEOF,
+		snapshotter:     &fakeSnapshotter{},
+	}
+	installer := &Installer{client: cli}
+
+	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	if err == nil || !strings.Contains(err.Error(), "failed to create installer container") {
+		t.Fatalf("expected installer create error, got %v", err)
+	}
+	if len(cli.snapshotter.removed) != 1 || cli.snapshotter.removed[0] != spec.ID+"-rootfs" {
+		t.Fatalf("expected installer snapshot %q to be removed, got %v", spec.ID+"-rootfs", cli.snapshotter.removed)
+	}
+}
+
+func TestInstallerExecuteCleansTaskAndContainerWhenStartFails(t *testing.T) {
+	newContainerdTestConfig(t)
+	spec := newContainerdTestInstallationSpec(t)
+	task := &fakeTask{startErr: io.ErrClosedPipe}
+	container := &fakeContainer{
+		id:      spec.ID,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli := &fakeClient{
+		container: container,
+		getImage:  fakeImage{name: spec.Image},
+	}
+	installer := &Installer{client: cli}
+
+	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	if err == nil || !strings.Contains(err.Error(), "failed to start installer task") {
+		t.Fatalf("expected installer start error, got %v", err)
+	}
+	if task.deleteCalls == 0 {
+		t.Fatal("expected failed installer start to delete the task")
+	}
+	if !container.deleted {
+		t.Fatal("expected failed installer start to delete the container")
+	}
+}
+
 func TestRestoredStartedAtTakesPrecedenceOverContainerLabel(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	stateStartedAt := time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC)
@@ -519,6 +566,35 @@ func newContainerdTestConfig(t *testing.T) {
 	cfg.Containerd.LogMaxFiles = 1
 	cfg.Containerd.ImagePullTimeout = 900
 	config.Set(cfg)
+}
+
+func newContainerdTestInstallationSpec(t *testing.T) environment.InstallationSpec {
+	t.Helper()
+	dir := t.TempDir()
+	serverPath := filepath.Join(dir, "server")
+	tempPath := filepath.Join(dir, "install")
+	for _, path := range []string{serverPath, tempPath} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatalf("failed to create %s: %v", path, err)
+		}
+	}
+	return environment.InstallationSpec{
+		ID:         "test-installer",
+		Image:      "example.com/installer:latest",
+		Entrypoint: "/bin/sh",
+		ScriptPath: "/mnt/install/install.sh",
+		TempPath:   tempPath,
+		ServerPath: serverPath,
+		Env:        []string{"SERVER_MEMORY=128"},
+		Limits: environment.Limits{
+			MemoryLimit: 128,
+			OOMKiller:   true,
+		},
+		Allocations: environment.Allocations{
+			DefaultMapping: &environment.DefaultAllocationMapping{Ip: "0.0.0.0", Port: 25565},
+			Mappings:       map[string][]int{"0.0.0.0": []int{25565}},
+		},
+	}
 }
 
 func cgroup2Metric(t *testing.T, usage, inactiveFile, cpuUsec uint64) *apitypes.Metric {
