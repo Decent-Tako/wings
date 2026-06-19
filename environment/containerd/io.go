@@ -80,6 +80,9 @@ func (e *Environment) Attach(ctx context.Context) error {
 		createdTask = true
 	}
 
+	// Register Wait before Start. Start() creates a new task through Attach(),
+	// then starts that same task after Attach returns; registering the wait
+	// channel here makes immediate exits observable instead of racing startup.
 	exitC, err := task.Wait(e.context(ctx))
 	if err != nil {
 		if createdTask {

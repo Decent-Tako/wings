@@ -34,7 +34,7 @@ func (e *Environment) Exists() (bool, error) {
 	return true, nil
 }
 
-func (e *Environment) Create() error {
+func (e *Environment) Create() (err error) {
 	ctx := e.context(context.Background())
 
 	if _, err := e.client.LoadContainer(ctx, e.Id); err == nil {
@@ -70,13 +70,24 @@ func (e *Environment) Create() error {
 	}
 	specOpts = append(specOpts, resourceSpecOpts(e.Configuration.Limits())...)
 
+	snapshotID := e.snapshotID()
+	cleanupSnapshotOnError := true
+	defer func() {
+		if err == nil || !cleanupSnapshotOnError {
+			return
+		}
+		if cleanupErr := cleanupContainerdSnapshot(context.Background(), e.client, cfg.Containerd.Snapshotter, snapshotID, e.log()); cleanupErr != nil {
+			e.log().WithField("error", cleanupErr).Warn("failed to cleanup containerd snapshot after create error")
+		}
+	}()
+
 	if _, err := e.client.NewContainer(
 		ctx,
 		e.Id,
 		containerdclient.WithImage(image),
 		containerdclient.WithImageName(strings.TrimPrefix(e.meta.Image, "~")),
 		containerdclient.WithSnapshotter(cfg.Containerd.Snapshotter),
-		containerdclient.WithNewSnapshot(e.snapshotID(), image),
+		containerdclient.WithNewSnapshot(snapshotID, image),
 		containerdclient.WithNewSpec(specOpts...),
 		containerdclient.WithRuntime(cfg.Containerd.Runtime, nil),
 		containerdclient.WithContainerLabels(labels),
@@ -86,6 +97,7 @@ func (e *Environment) Create() error {
 		}
 		return errors.Wrap(err, "environment/containerd: failed to create container")
 	}
+	cleanupSnapshotOnError = false
 
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	containerdclient "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/errdefs"
 
 	"github.com/pelican-dev/wings/environment"
@@ -71,11 +72,16 @@ func (e *Environment) Start(ctx context.Context) error {
 	task := e.task
 	if task == nil {
 		e.mu.Unlock()
+		e.closeAttach()
 		return errors.New("environment/containerd: no task available after attach")
 	}
 
 	if err := task.Start(e.context(actx)); err != nil {
 		e.mu.Unlock()
+		if _, cleanupErr := task.Delete(e.context(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
+			warnContainerdCleanupError(e.log(), cleanupErr, "failed to delete containerd task after start error")
+		}
+		e.closeAttach()
 		return errors.Wrap(err, "environment/containerd: failed to start task")
 	}
 	e.mu.Unlock()
@@ -110,20 +116,19 @@ func (e *Environment) Stop(ctx context.Context) error {
 }
 
 func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, terminate bool) error {
-	tctx, cancel := context.WithTimeout(context.Background(), duration)
+	tctx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancel()
-		case <-tctx.Done():
+	onTimeout := func(err error) error {
+		if terminate {
+			return e.Terminate(context.WithoutCancel(ctx), "SIGKILL")
 		}
-	}()
+		return err
+	}
 
 	if err := e.Stop(tctx); err != nil {
-		if terminate && errors.Is(err, context.DeadlineExceeded) {
-			return e.Terminate(ctx, "SIGKILL")
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return onTimeout(err)
 		}
 		return err
 	}
@@ -144,16 +149,8 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 	}
 
 	select {
-	case <-ctx.Done():
-		if terminate {
-			return e.Terminate(ctx, "SIGKILL")
-		}
-		return ctx.Err()
 	case <-tctx.Done():
-		if terminate {
-			return e.Terminate(ctx, "SIGKILL")
-		}
-		return tctx.Err()
+		return onTimeout(tctx.Err())
 	case <-exitC:
 		return nil
 	}

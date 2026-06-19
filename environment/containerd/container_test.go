@@ -18,6 +18,8 @@ import (
 	"github.com/containerd/containerd/v2/core/content"
 	ctrevents "github.com/containerd/containerd/v2/core/events"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
@@ -29,6 +31,7 @@ import (
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	"github.com/pelican-dev/wings/remote"
 )
 
 func TestCreatePullsImageAndCreatesContainer(t *testing.T) {
@@ -126,6 +129,38 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 	}
 	if cli.pullRef == "" || cli.getRef == "" {
 		t.Fatalf("expected both Pull and GetImage to be attempted, pull=%q get=%q", cli.pullRef, cli.getRef)
+	}
+}
+
+func TestCreateCleansSnapshotWhenNewContainerFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.loadErr = errdefs.ErrNotFound
+	cli.pullImage = fakeImage{name: "example.com/server:latest"}
+	cli.newContainerErr = io.ErrUnexpectedEOF
+	cli.snapshotter = &fakeSnapshotter{}
+
+	err := env.Create()
+	if err == nil || !strings.Contains(err.Error(), "failed to create container") {
+		t.Fatalf("expected create error, got %v", err)
+	}
+	if len(cli.snapshotter.removed) != 1 || cli.snapshotter.removed[0] != env.snapshotID() {
+		t.Fatalf("expected snapshot %q to be removed, got %v", env.snapshotID(), cli.snapshotter.removed)
+	}
+}
+
+func TestCreatePreservesOriginalErrorWhenSnapshotCleanupFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.loadErr = errdefs.ErrNotFound
+	cli.pullImage = fakeImage{name: "example.com/server:latest"}
+	cli.newContainerErr = io.ErrUnexpectedEOF
+	cli.snapshotter = &fakeSnapshotter{removeErr: io.ErrClosedPipe}
+
+	err := env.Create()
+	if err == nil || !strings.Contains(err.Error(), "failed to create container") {
+		t.Fatalf("expected original create error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "closed pipe") {
+		t.Fatalf("expected snapshot cleanup error not to replace original error, got %v", err)
 	}
 }
 
@@ -243,6 +278,97 @@ func TestStartCleansCreatedTaskAndContainerWhenStartFails(t *testing.T) {
 	}
 	if env.State() != environment.ProcessOfflineState {
 		t.Fatalf("expected failed start to leave environment offline, got %q", env.State())
+	}
+}
+
+func TestRemoveContainerIsIdempotent(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.loadErr = errdefs.ErrNotFound
+	if err := env.removeContainer(context.Background()); err != nil {
+		t.Fatalf("expected missing container removal to be nil, got %v", err)
+	}
+
+	cli.loadErr = nil
+	cli.container = &fakeContainer{
+		id:        env.Id,
+		taskErr:   errdefs.ErrNotFound,
+		deleteErr: errdefs.ErrNotFound,
+		labels:    map[string]string{},
+	}
+	if err := env.removeContainer(context.Background()); err != nil {
+		t.Fatalf("expected already-deleted container removal to be nil, got %v", err)
+	}
+}
+
+func TestStartHandlesImmediateExitAfterWaitBeforeStart(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		exitOnStart: true,
+		waitCh:      make(chan containerdclient.ExitStatus, 1),
+	}
+	container := &fakeContainer{
+		id:      env.Id,
+		taskErr: errdefs.ErrNotFound,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli.loadErr = errdefs.ErrNotFound
+	cli.container = container
+
+	if err := env.Start(context.Background()); err != nil {
+		t.Fatalf("Start() returned error: %v", err)
+	}
+	waitForContainerdState(t, env, environment.ProcessOfflineState, time.Second)
+	if task.deleteCalls == 0 {
+		t.Fatal("expected exited immediate task to be deleted")
+	}
+	if env.IsAttached() {
+		t.Fatal("expected immediate exit to close attach state")
+	}
+}
+
+func TestWaitForStopReturnsForImmediateExit(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		status: containerdclient.Running,
+		waitCh: make(chan containerdclient.ExitStatus, 1),
+	}
+	task.waitCh <- *containerdclient.NewExitStatus(0, time.Now(), nil)
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	attachContainerdTestStdin(t, env)
+	env.SetProcessMetadata(environment.ProcessMetadata{
+		Image: "example.com/server:latest",
+		Stop:  remote.ProcessStopConfiguration{Type: remote.ProcessStopCommand, Value: "stop"},
+	})
+	env.SetState(environment.ProcessRunningState)
+
+	if err := env.WaitForStop(context.Background(), time.Second, true); err != nil {
+		t.Fatalf("WaitForStop() returned error: %v", err)
+	}
+	if len(task.killed) != 0 {
+		t.Fatalf("expected immediate exit not to be killed, got %v", task.killed)
+	}
+}
+
+func TestWaitForStopTerminatesSlowExitWhenRequested(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		status: containerdclient.Running,
+		waitCh: make(chan containerdclient.ExitStatus),
+	}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	attachContainerdTestStdin(t, env)
+	env.SetProcessMetadata(environment.ProcessMetadata{
+		Image: "example.com/server:latest",
+		Stop:  remote.ProcessStopConfiguration{Type: remote.ProcessStopCommand, Value: "stop"},
+	})
+	env.SetState(environment.ProcessRunningState)
+
+	if err := env.WaitForStop(context.Background(), 10*time.Millisecond, true); err != nil {
+		t.Fatalf("WaitForStop() returned error: %v", err)
+	}
+	if len(task.killed) == 0 || task.killed[len(task.killed)-1] != syscall.SIGKILL {
+		t.Fatalf("expected slow exit to receive SIGKILL, got %v", task.killed)
 	}
 }
 
@@ -407,12 +533,50 @@ func cgroup2Metric(t *testing.T, usage, inactiveFile, cpuUsec uint64) *apitypes.
 	return &apitypes.Metric{Data: data}
 }
 
+func attachContainerdTestStdin(t *testing.T, env *Environment) {
+	t.Helper()
+	stdinR, stdinW := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(io.Discard, stdinR)
+	}()
+	t.Cleanup(func() {
+		_ = stdinW.Close()
+		_ = stdinR.Close()
+		<-done
+	})
+
+	env.mu.Lock()
+	env.stdin = stdinW
+	env.mu.Unlock()
+}
+
+func waitForContainerdState(t *testing.T, env *Environment, state string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if env.State() == state {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for state %q, got %q", state, env.State())
+		case <-ticker.C:
+		}
+	}
+}
+
 type fakeClient struct {
 	container containerdclient.Container
 	loadErr   error
 
 	newContainerID   string
 	newContainerOpts []containerdclient.NewContainerOpts
+	newContainerErr  error
 
 	getRef   string
 	getImage containerdclient.Image
@@ -424,6 +588,8 @@ type fakeClient struct {
 
 	events chan *ctrevents.Envelope
 	errs   chan error
+
+	snapshotter *fakeSnapshotter
 }
 
 func (f *fakeClient) LoadContainer(context.Context, string) (containerdclient.Container, error) {
@@ -436,6 +602,9 @@ func (f *fakeClient) LoadContainer(context.Context, string) (containerdclient.Co
 func (f *fakeClient) NewContainer(_ context.Context, id string, opts ...containerdclient.NewContainerOpts) (containerdclient.Container, error) {
 	f.newContainerID = id
 	f.newContainerOpts = opts
+	if f.newContainerErr != nil {
+		return nil, f.newContainerErr
+	}
 	if f.container == nil {
 		f.container = &fakeContainer{id: id, labels: map[string]string{}}
 	}
@@ -473,6 +642,13 @@ func (f *fakeClient) Subscribe(context.Context, ...string) (<-chan *ctrevents.En
 		f.errs = make(chan error)
 	}
 	return f.events, f.errs
+}
+
+func (f *fakeClient) SnapshotService(string) snapshots.Snapshotter {
+	if f.snapshotter == nil {
+		f.snapshotter = &fakeSnapshotter{}
+	}
+	return f.snapshotter
 }
 
 type fakeContainer struct {
@@ -564,8 +740,9 @@ func (f *fakeContainer) Restore(context.Context, cio.Creator, string) (int, erro
 type fakeTask struct {
 	status containerdclient.ProcessStatus
 
-	waitCh  chan containerdclient.ExitStatus
-	waitErr error
+	waitCh      chan containerdclient.ExitStatus
+	waitErr     error
+	exitOnStart bool
 
 	metric    *apitypes.Metric
 	metricErr error
@@ -586,6 +763,15 @@ func (f *fakeTask) Start(context.Context) error {
 	f.startCalls++
 	if f.startErr != nil {
 		return f.startErr
+	}
+	if f.exitOnStart {
+		if f.waitCh == nil {
+			f.waitCh = make(chan containerdclient.ExitStatus, 1)
+		}
+		f.waitCh <- *containerdclient.NewExitStatus(0, time.Now(), nil)
+		close(f.waitCh)
+		f.status = containerdclient.Stopped
+		return nil
 	}
 	f.status = containerdclient.Running
 	return nil
@@ -696,7 +882,55 @@ func (f fakeImage) Platform() platforms.MatchComparer { return nil }
 
 func (f fakeImage) Spec(context.Context) (ocispec.Image, error) { return ocispec.Image{}, nil }
 
+type fakeSnapshotter struct {
+	removed   []string
+	removeErr error
+}
+
+func (f *fakeSnapshotter) Stat(context.Context, string) (snapshots.Info, error) {
+	return snapshots.Info{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Update(context.Context, snapshots.Info, ...string) (snapshots.Info, error) {
+	return snapshots.Info{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Usage(context.Context, string) (snapshots.Usage, error) {
+	return snapshots.Usage{}, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Mounts(context.Context, string) ([]mount.Mount, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Prepare(context.Context, string, string, ...snapshots.Opt) ([]mount.Mount, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) View(context.Context, string, string, ...snapshots.Opt) ([]mount.Mount, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Commit(context.Context, string, string, ...snapshots.Opt) error {
+	return errdefs.ErrNotImplemented
+}
+
+func (f *fakeSnapshotter) Remove(_ context.Context, key string) error {
+	f.removed = append(f.removed, key)
+	return f.removeErr
+}
+
+func (f *fakeSnapshotter) Walk(context.Context, snapshots.WalkFunc, ...string) error {
+	return nil
+}
+
+func (f *fakeSnapshotter) Close() error {
+	return nil
+}
+
 var _ clientAPI = (*fakeClient)(nil)
+var _ snapshotServiceProvider = (*fakeClient)(nil)
 var _ containerdclient.Container = (*fakeContainer)(nil)
 var _ containerdclient.Task = (*fakeTask)(nil)
 var _ containerdclient.Image = (*fakeImage)(nil)
+var _ snapshots.Snapshotter = (*fakeSnapshotter)(nil)
