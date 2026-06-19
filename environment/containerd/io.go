@@ -246,7 +246,7 @@ func (e *Environment) watchOOM(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if event == nil || event.Topic != ctrruntime.TaskOOMEventTopic {
+			if event == nil || event.Event == nil || event.Topic != ctrruntime.TaskOOMEventTopic {
 				continue
 			}
 			var oom eventtypes.TaskOOM
@@ -339,7 +339,7 @@ func (w *rotatingLogWriter) Write(p []byte) (int, error) {
 		if w.maxSize > 0 {
 			remaining := w.maxSize - w.size
 			if remaining < int64(len(chunk)) {
-				chunk = p[:remaining]
+				chunk = p[:int(remaining)]
 			}
 		}
 

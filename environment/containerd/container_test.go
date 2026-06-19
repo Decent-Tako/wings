@@ -1,0 +1,640 @@
+package containerd
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	cgroup2 "github.com/containerd/cgroups/v3/cgroup2/stats"
+	apitypes "github.com/containerd/containerd/api/types"
+	containerdclient "github.com/containerd/containerd/v2/client"
+	containerdcontainers "github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/content"
+	ctrevents "github.com/containerd/containerd/v2/core/events"
+	containerdimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+	"github.com/containerd/typeurl/v2"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/pelican-dev/wings/config"
+	"github.com/pelican-dev/wings/environment"
+)
+
+func TestCreatePullsImageAndCreatesContainer(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.loadErr = errdefs.ErrNotFound
+	cli.pullImage = fakeImage{name: "example.com/server:latest"}
+
+	if err := env.Create(); err != nil {
+		t.Fatalf("Create() returned error: %v", err)
+	}
+
+	if cli.pullRef != "example.com/server:latest" {
+		t.Fatalf("expected image pull for server image, got %q", cli.pullRef)
+	}
+	if cli.newContainerID != env.Id {
+		t.Fatalf("expected NewContainer for %q, got %q", env.Id, cli.newContainerID)
+	}
+	if len(cli.newContainerOpts) == 0 {
+		t.Fatal("expected container creation options to be passed")
+	}
+}
+
+func TestCreateUsesLocalImageWhenImageIsPrefixedWithTilde(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	env.SetProcessMetadata(environment.ProcessMetadata{Image: "~local/server:latest"})
+	cli.loadErr = errdefs.ErrNotFound
+	cli.getImage = fakeImage{name: "local/server:latest"}
+
+	if err := env.Create(); err != nil {
+		t.Fatalf("Create() returned error: %v", err)
+	}
+
+	if cli.pullRef != "" {
+		t.Fatalf("expected local image path to skip Pull, pulled %q", cli.pullRef)
+	}
+	if cli.getRef != "local/server:latest" {
+		t.Fatalf("expected GetImage without tilde, got %q", cli.getRef)
+	}
+}
+
+func TestCreateRejectsUnsupportedContainerdNetworking(t *testing.T) {
+	t.Run("non host mode", func(t *testing.T) {
+		env, cli := newContainerdTestEnvironment(t)
+		cli.loadErr = errdefs.ErrNotFound
+		config.Get().Docker.Network.Mode = "pelican"
+
+		err := env.Create()
+		if err == nil || !strings.Contains(err.Error(), "host networking only") {
+			t.Fatalf("expected host networking validation error, got %v", err)
+		}
+	})
+
+	t.Run("force outgoing ip", func(t *testing.T) {
+		env, cli := newContainerdTestEnvironment(t)
+		cli.loadErr = errdefs.ErrNotFound
+		env.Configuration.SetSettings(environment.Settings{
+			Allocations: environment.Allocations{ForceOutgoingIP: true},
+			Limits:      environment.Limits{MemoryLimit: 128, OOMKiller: true},
+		})
+
+		err := env.Create()
+		if err == nil || !strings.Contains(err.Error(), "force_outgoing_ip") {
+			t.Fatalf("expected force_outgoing_ip validation error, got %v", err)
+		}
+	})
+
+	t.Run("macvlan", func(t *testing.T) {
+		env, cli := newContainerdTestEnvironment(t)
+		cli.loadErr = errdefs.ErrNotFound
+		config.Get().Docker.Network.Driver = "macvlan"
+
+		err := env.Create()
+		if err == nil || !strings.Contains(err.Error(), "macvlan") {
+			t.Fatalf("expected macvlan validation error, got %v", err)
+		}
+	})
+}
+
+func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T) {
+	cli := &fakeClient{
+		pullErr:  io.ErrUnexpectedEOF,
+		getImage: fakeImage{name: "example.com/server:latest"},
+	}
+
+	img, err := ensureContainerdImage(context.Background(), cli, "example.com/server:latest", nil)
+	if err != nil {
+		t.Fatalf("ensureContainerdImage() returned error: %v", err)
+	}
+	if img.Name() != "example.com/server:latest" {
+		t.Fatalf("expected local fallback image, got %q", img.Name())
+	}
+	if cli.pullRef == "" || cli.getRef == "" {
+		t.Fatalf("expected both Pull and GetImage to be attempted, pull=%q get=%q", cli.pullRef, cli.getRef)
+	}
+}
+
+func TestImagePullContextPreservesCallerCancellation(t *testing.T) {
+	newContainerdTestConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	pullCtx, pullCancel := imagePullContext(ctx)
+	defer pullCancel()
+
+	select {
+	case <-pullCtx.Done():
+		if pullCtx.Err() != context.Canceled {
+			t.Fatalf("expected caller cancellation, got %v", pullCtx.Err())
+		}
+	default:
+		t.Fatal("expected pull context to be canceled with caller context")
+	}
+}
+
+func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{waitErr: io.ErrClosedPipe}
+	cli.container = &fakeContainer{
+		id:      env.Id,
+		taskErr: errdefs.ErrNotFound,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+
+	err := env.Attach(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed to wait on task") {
+		t.Fatalf("expected wait error from Attach, got %v", err)
+	}
+	if task.deleteCalls != 1 {
+		t.Fatalf("expected new task to be deleted after Wait failure, got %d deletes", task.deleteCalls)
+	}
+}
+
+func TestStartReattachesRunningTaskAndRestoresStartedAt(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	startedAt := time.Now().Add(-2 * time.Minute).UTC()
+	task := &fakeTask{
+		status: containerdclient.Running,
+		waitCh: make(chan containerdclient.ExitStatus),
+	}
+	cli.container = &fakeContainer{
+		id:     env.Id,
+		task:   task,
+		labels: map[string]string{labelStartedAt: startedAt.Format(time.RFC3339Nano)},
+	}
+	defer env.closeAttach()
+
+	if err := env.Start(context.Background()); err != nil {
+		t.Fatalf("Start() returned error: %v", err)
+	}
+	if task.startCalls != 0 {
+		t.Fatalf("expected running task reattach to skip Start, got %d calls", task.startCalls)
+	}
+	if env.State() != environment.ProcessRunningState {
+		t.Fatalf("expected running state after reattach, got %q", env.State())
+	}
+
+	uptime, err := env.Uptime(context.Background())
+	if err != nil {
+		t.Fatalf("Uptime() returned error: %v", err)
+	}
+	if uptime <= 0 {
+		t.Fatalf("expected restored uptime to be positive, got %d", uptime)
+	}
+}
+
+func TestTerminateKillsRunningTaskAndSetsOffline(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	env.SetState(environment.ProcessRunningState)
+
+	if err := env.Terminate(context.Background(), "SIGTERM"); err != nil {
+		t.Fatalf("Terminate() returned error: %v", err)
+	}
+	if len(task.killed) == 0 || task.killed[0] != syscall.SIGTERM {
+		t.Fatalf("expected SIGTERM kill, got %v", task.killed)
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected offline state after terminate, got %q", env.State())
+	}
+}
+
+func TestPollResourcesPublishesStatsWithUnsupportedNetwork(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	metric := cgroup2Metric(t, 2048, 512, 250)
+	task := &fakeTask{status: containerdclient.Running, metric: metric}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	env.SetState(environment.ProcessRunningState)
+	env.setStartedAt(context.Background(), time.Now().Add(-time.Minute))
+
+	ch := make(chan []byte, 4)
+	env.Events().On(ch)
+	defer env.Events().Off(ch)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- env.pollResources(ctx) }()
+
+	var event struct {
+		Topic string            `json:"topic"`
+		Data  environment.Stats `json:"data"`
+	}
+	select {
+	case raw := <-ch:
+		if err := json.Unmarshal(raw, &event); err != nil {
+			t.Fatalf("failed to decode resource event: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for resource event")
+	}
+
+	if event.Topic != environment.ResourceEvent {
+		t.Fatalf("expected resource event, got %q", event.Topic)
+	}
+	if event.Data.Memory != 1536 {
+		t.Fatalf("expected inactive file memory to be subtracted, got %d", event.Data.Memory)
+	}
+	if event.Data.Uptime <= 0 {
+		t.Fatalf("expected positive uptime, got %d", event.Data.Uptime)
+	}
+	if event.Data.Network.RxBytes != 0 || event.Data.Network.TxBytes != 0 {
+		t.Fatalf("expected unsupported network stats to remain zero, got %+v", event.Data.Network)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("pollResources returned unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pollResources to stop")
+	}
+}
+
+func TestReadlogTailsRotatedLogs(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	config.Get().Containerd.LogMaxSize = "12b"
+	config.Get().Containerd.LogMaxFiles = 3
+
+	writer, err := newRotatingLogWriter(env.logPath())
+	if err != nil {
+		t.Fatalf("newRotatingLogWriter() returned error: %v", err)
+	}
+	for _, line := range []string{"l01\n", "l02\n", "l03\n", "l04\n", "l05\n", "l06\n", "l07\n"} {
+		if _, err := writer.Write([]byte(line)); err != nil {
+			t.Fatalf("failed to write log line %q: %v", line, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close log writer: %v", err)
+	}
+	if _, err := os.Stat(rotatedLogPath(env.logPath(), 1)); err != nil {
+		t.Fatalf("expected rotated log file: %v", err)
+	}
+
+	lines, err := env.Readlog(5)
+	if err != nil {
+		t.Fatalf("Readlog() returned error: %v", err)
+	}
+	expected := []string{"l03", "l04", "l05", "l06", "l07"}
+	if strings.Join(lines, ",") != strings.Join(expected, ",") {
+		t.Fatalf("expected %v, got %v", expected, lines)
+	}
+}
+
+func newContainerdTestEnvironment(t *testing.T) (*Environment, *fakeClient) {
+	t.Helper()
+	newContainerdTestConfig(t)
+
+	cfg := environment.NewConfiguration(environment.Settings{
+		Allocations: environment.Allocations{
+			DefaultMapping: &environment.DefaultAllocationMapping{Ip: "0.0.0.0", Port: 25565},
+			Mappings:       map[string][]int{"0.0.0.0": []int{25565}},
+		},
+		Limits: environment.Limits{
+			MemoryLimit: 128,
+			Swap:        0,
+			CpuLimit:    100,
+			OOMKiller:   true,
+		},
+		Labels: map[string]string{"test": "true"},
+	}, []string{"SERVER_MEMORY=128"})
+
+	cli := &fakeClient{
+		loadErr:   errdefs.ErrNotFound,
+		pullImage: fakeImage{name: "example.com/server:latest"},
+		events:    make(chan *ctrevents.Envelope),
+		errs:      make(chan error),
+	}
+	env := New("test-server", environment.ProcessMetadata{Image: "example.com/server:latest"}, cfg, cli)
+	cli.container = &fakeContainer{id: env.Id, labels: map[string]string{}}
+	return env, cli
+}
+
+func newContainerdTestConfig(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg, err := config.NewAtPath(filepath.Join(dir, "wings.yml"))
+	if err != nil {
+		t.Fatalf("failed to create config: %v", err)
+	}
+	cfg.Docker.Network.Mode = "host"
+	cfg.Docker.Network.Driver = "bridge"
+	cfg.Docker.TmpfsSize = 64
+	cfg.Docker.ContainerPidLimit = 512
+	cfg.Containerd.RuntimeRoot = filepath.Join(dir, "runtime")
+	cfg.Containerd.LogDirectory = filepath.Join(dir, "logs")
+	cfg.Containerd.LogMaxSize = "5m"
+	cfg.Containerd.LogMaxFiles = 1
+	cfg.Containerd.ImagePullTimeout = 900
+	config.Set(cfg)
+}
+
+func cgroup2Metric(t *testing.T, usage, inactiveFile, cpuUsec uint64) *apitypes.Metric {
+	t.Helper()
+	data, err := typeurl.MarshalAnyToProto(&cgroup2.Metrics{
+		Memory: &cgroup2.MemoryStat{Usage: usage, InactiveFile: inactiveFile},
+		CPU:    &cgroup2.CPUStat{UsageUsec: cpuUsec},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal cgroup2 metric: %v", err)
+	}
+	return &apitypes.Metric{Data: data}
+}
+
+type fakeClient struct {
+	container containerdclient.Container
+	loadErr   error
+
+	newContainerID   string
+	newContainerOpts []containerdclient.NewContainerOpts
+
+	getRef   string
+	getImage containerdclient.Image
+	getErr   error
+
+	pullRef   string
+	pullImage containerdclient.Image
+	pullErr   error
+
+	events chan *ctrevents.Envelope
+	errs   chan error
+}
+
+func (f *fakeClient) LoadContainer(context.Context, string) (containerdclient.Container, error) {
+	if f.loadErr != nil {
+		return nil, f.loadErr
+	}
+	return f.container, nil
+}
+
+func (f *fakeClient) NewContainer(_ context.Context, id string, opts ...containerdclient.NewContainerOpts) (containerdclient.Container, error) {
+	f.newContainerID = id
+	f.newContainerOpts = opts
+	if f.container == nil {
+		f.container = &fakeContainer{id: id, labels: map[string]string{}}
+	}
+	f.loadErr = nil
+	return f.container, nil
+}
+
+func (f *fakeClient) GetImage(_ context.Context, ref string) (containerdclient.Image, error) {
+	f.getRef = ref
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.getImage != nil {
+		return f.getImage, nil
+	}
+	return nil, errdefs.ErrNotFound
+}
+
+func (f *fakeClient) Pull(_ context.Context, ref string, _ ...containerdclient.RemoteOpt) (containerdclient.Image, error) {
+	f.pullRef = ref
+	if f.pullErr != nil {
+		return nil, f.pullErr
+	}
+	if f.pullImage != nil {
+		return f.pullImage, nil
+	}
+	return nil, errdefs.ErrNotFound
+}
+
+func (f *fakeClient) Subscribe(context.Context, ...string) (<-chan *ctrevents.Envelope, <-chan error) {
+	if f.events == nil {
+		f.events = make(chan *ctrevents.Envelope)
+	}
+	if f.errs == nil {
+		f.errs = make(chan error)
+	}
+	return f.events, f.errs
+}
+
+type fakeContainer struct {
+	id string
+
+	task    containerdclient.Task
+	taskErr error
+
+	newTask    containerdclient.Task
+	newTaskErr error
+
+	labels    map[string]string
+	deleteErr error
+	deleted   bool
+}
+
+func (f *fakeContainer) ID() string { return f.id }
+
+func (f *fakeContainer) Info(context.Context, ...containerdclient.InfoOpts) (containerdcontainers.Container, error) {
+	return containerdcontainers.Container{ID: f.id, Labels: f.labels}, nil
+}
+
+func (f *fakeContainer) Delete(context.Context, ...containerdclient.DeleteOpts) error {
+	f.deleted = true
+	return f.deleteErr
+}
+
+func (f *fakeContainer) NewTask(context.Context, cio.Creator, ...containerdclient.NewTaskOpts) (containerdclient.Task, error) {
+	if f.newTaskErr != nil {
+		return nil, f.newTaskErr
+	}
+	if f.newTask != nil {
+		f.task = f.newTask
+		return f.newTask, nil
+	}
+	f.task = &fakeTask{status: containerdclient.Created}
+	return f.task, nil
+}
+
+func (f *fakeContainer) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
+
+func (f *fakeContainer) Task(context.Context, cio.Attach) (containerdclient.Task, error) {
+	if f.taskErr != nil {
+		return nil, f.taskErr
+	}
+	if f.task == nil {
+		return nil, errdefs.ErrNotFound
+	}
+	return f.task, nil
+}
+
+func (f *fakeContainer) Image(context.Context) (containerdclient.Image, error) {
+	return fakeImage{name: "example.com/server:latest"}, nil
+}
+
+func (f *fakeContainer) Labels(context.Context) (map[string]string, error) {
+	if f.labels == nil {
+		f.labels = map[string]string{}
+	}
+	out := make(map[string]string, len(f.labels))
+	for key, value := range f.labels {
+		out[key] = value
+	}
+	return out, nil
+}
+
+func (f *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (map[string]string, error) {
+	f.labels = make(map[string]string, len(labels))
+	for key, value := range labels {
+		f.labels[key] = value
+	}
+	return f.Labels(context.Background())
+}
+
+func (f *fakeContainer) Extensions(context.Context) (map[string]typeurl.Any, error) {
+	return map[string]typeurl.Any{}, nil
+}
+
+func (f *fakeContainer) Update(context.Context, ...containerdclient.UpdateContainerOpts) error {
+	return nil
+}
+
+func (f *fakeContainer) Checkpoint(context.Context, string, ...containerdclient.CheckpointOpts) (containerdclient.Image, error) {
+	return fakeImage{name: "checkpoint"}, nil
+}
+
+func (f *fakeContainer) Restore(context.Context, cio.Creator, string) (int, error) { return 0, nil }
+
+type fakeTask struct {
+	status containerdclient.ProcessStatus
+
+	waitCh  chan containerdclient.ExitStatus
+	waitErr error
+
+	metric    *apitypes.Metric
+	metricErr error
+
+	startCalls  int
+	deleteCalls int
+	killed      []syscall.Signal
+}
+
+func (f *fakeTask) ID() string { return "test-server" }
+
+func (f *fakeTask) Pid() uint32 { return 1234 }
+
+func (f *fakeTask) Start(context.Context) error {
+	f.startCalls++
+	f.status = containerdclient.Running
+	return nil
+}
+
+func (f *fakeTask) Delete(context.Context, ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
+	f.deleteCalls++
+	f.status = containerdclient.Stopped
+	return containerdclient.NewExitStatus(0, time.Now(), nil), nil
+}
+
+func (f *fakeTask) Kill(_ context.Context, signal syscall.Signal, _ ...containerdclient.KillOpts) error {
+	f.killed = append(f.killed, signal)
+	f.status = containerdclient.Stopped
+	return nil
+}
+
+func (f *fakeTask) Wait(context.Context) (<-chan containerdclient.ExitStatus, error) {
+	if f.waitErr != nil {
+		return nil, f.waitErr
+	}
+	if f.waitCh == nil {
+		f.waitCh = make(chan containerdclient.ExitStatus)
+	}
+	return f.waitCh, nil
+}
+
+func (f *fakeTask) CloseIO(context.Context, ...containerdclient.IOCloserOpts) error { return nil }
+
+func (f *fakeTask) Resize(context.Context, uint32, uint32) error { return nil }
+
+func (f *fakeTask) IO() cio.IO { return nil }
+
+func (f *fakeTask) Status(context.Context) (containerdclient.Status, error) {
+	return containerdclient.Status{Status: f.status}, nil
+}
+
+func (f *fakeTask) Pause(context.Context) error { return nil }
+
+func (f *fakeTask) Resume(context.Context) error { return nil }
+
+func (f *fakeTask) Exec(context.Context, string, *specs.Process, cio.Creator) (containerdclient.Process, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeTask) Pids(context.Context) ([]containerdclient.ProcessInfo, error) { return nil, nil }
+
+func (f *fakeTask) Checkpoint(context.Context, ...containerdclient.CheckpointTaskOpts) (containerdclient.Image, error) {
+	return fakeImage{name: "checkpoint"}, nil
+}
+
+func (f *fakeTask) Update(context.Context, ...containerdclient.UpdateTaskOpts) error { return nil }
+
+func (f *fakeTask) LoadProcess(context.Context, string, cio.Attach) (containerdclient.Process, error) {
+	return nil, errdefs.ErrNotImplemented
+}
+
+func (f *fakeTask) Metrics(context.Context) (*apitypes.Metric, error) {
+	if f.metricErr != nil {
+		return nil, f.metricErr
+	}
+	return f.metric, nil
+}
+
+func (f *fakeTask) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
+
+type fakeImage struct {
+	name string
+}
+
+func (f fakeImage) Name() string { return f.name }
+
+func (f fakeImage) Target() ocispec.Descriptor {
+	return ocispec.Descriptor{Digest: digest.FromString(f.name)}
+}
+
+func (f fakeImage) Labels() map[string]string { return nil }
+
+func (f fakeImage) Unpack(context.Context, string, ...containerdclient.UnpackOpt) error { return nil }
+
+func (f fakeImage) RootFS(context.Context) ([]digest.Digest, error) { return nil, nil }
+
+func (f fakeImage) Size(context.Context) (int64, error) { return 0, nil }
+
+func (f fakeImage) Usage(context.Context, ...containerdclient.UsageOpt) (int64, error) {
+	return 0, nil
+}
+
+func (f fakeImage) Config(context.Context) (ocispec.Descriptor, error) {
+	return ocispec.Descriptor{}, nil
+}
+
+func (f fakeImage) IsUnpacked(context.Context, string) (bool, error) { return true, nil }
+
+func (f fakeImage) ContentStore() content.Store { return nil }
+
+func (f fakeImage) Metadata() containerdimages.Image {
+	return containerdimages.Image{Name: f.name}
+}
+
+func (f fakeImage) Platform() platforms.MatchComparer { return nil }
+
+func (f fakeImage) Spec(context.Context) (ocispec.Image, error) { return ocispec.Image{}, nil }
+
+var _ clientAPI = (*fakeClient)(nil)
+var _ containerdclient.Container = (*fakeContainer)(nil)
+var _ containerdclient.Task = (*fakeTask)(nil)
+var _ containerdclient.Image = (*fakeImage)(nil)
