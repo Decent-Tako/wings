@@ -66,9 +66,7 @@ func unsupportedNetworkStats() environment.NetworkStats {
 }
 
 func (e *Environment) uptimeMilliseconds(now time.Time) int64 {
-	e.mu.RLock()
-	startedAt := e.startedAt
-	e.mu.RUnlock()
+	startedAt := e.startedAtOrRestore(context.Background(), now)
 	if startedAt.IsZero() {
 		return 0
 	}

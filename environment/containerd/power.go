@@ -32,6 +32,7 @@ func (e *Environment) Start(ctx context.Context) error {
 		return errors.Wrap(err, "environment/containerd: failed to inspect task")
 	}
 	if running {
+		e.startedAtOrRestore(ctx, time.Now())
 		e.SetState(environment.ProcessRunningState)
 		return e.Attach(ctx)
 	}
@@ -64,8 +65,9 @@ func (e *Environment) Start(ctx context.Context) error {
 		return errors.Wrap(err, "environment/containerd: failed to start task")
 	}
 
+	e.setStartedAt(actx, time.Now())
 	e.mu.Lock()
-	e.startedAt = time.Now()
+	e.lastOOM = false
 	e.mu.Unlock()
 
 	sawError = false
@@ -237,7 +239,10 @@ func (e *Environment) Uptime(ctx context.Context) (int64, error) {
 	startedAt := e.startedAt
 	e.mu.RUnlock()
 	if startedAt.IsZero() {
-		return 0, nil
+		startedAt = e.startedAtOrRestore(ctx, time.Now())
+		if startedAt.IsZero() {
+			return 0, nil
+		}
 	}
 	return time.Since(startedAt).Milliseconds(), nil
 }

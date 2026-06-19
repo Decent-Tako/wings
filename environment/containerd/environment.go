@@ -22,6 +22,8 @@ var (
 	ErrUnsupportedNetwork = errors.Sentinel("unsupported containerd networking configuration")
 )
 
+const labelStartedAt = "pelican.dev/started_at"
+
 var _ environment.ProcessEnvironment = (*Environment)(nil)
 var _ environment.ProcessMetadataUpdater = (*Environment)(nil)
 var _ environment.AttachedState = (*Environment)(nil)
@@ -46,6 +48,7 @@ type Environment struct {
 	stdin     *io.PipeWriter
 	stdout    *io.PipeWriter
 	pollStop  context.CancelFunc
+	oomStop   context.CancelFunc
 	startedAt time.Time
 
 	lastExitCode uint32

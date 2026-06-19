@@ -12,9 +12,12 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	eventtypes "github.com/containerd/containerd/api/events"
 	containerdclient "github.com/containerd/containerd/v2/client"
+	ctrruntime "github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/typeurl/v2"
 	"github.com/docker/go-units"
 
 	"github.com/pelican-dev/wings/config"
@@ -91,16 +94,19 @@ func (e *Environment) Attach(ctx context.Context) error {
 	}
 
 	pollCtx, pollStop := context.WithCancel(context.Background())
+	oomCtx, oomStop := context.WithCancel(context.Background())
 	e.mu.Lock()
 	e.task = task
 	e.taskIO = task.IO()
 	e.stdin = stdinW
 	e.stdout = stdoutW
 	e.pollStop = pollStop
+	e.oomStop = oomStop
 	e.mu.Unlock()
 
 	go e.consumeOutput(stdoutR, logWriter)
 	go e.watchExit(exitC, task)
+	go e.watchOOM(oomCtx)
 	go func() {
 		if err := e.pollResources(pollCtx); err != nil && !errors.Is(err, context.Canceled) {
 			e.log().WithField("error", err).Warn("error during environment resource polling")
@@ -182,7 +188,6 @@ func (e *Environment) watchExit(exitC <-chan containerdclient.ExitStatus, task c
 	e.mu.Lock()
 	e.lastExitCode = code
 	e.lastExitTime = exitedAt
-	e.lastOOM = false
 	e.mu.Unlock()
 
 	_, _ = task.Delete(e.context(context.Background()))
@@ -196,15 +201,20 @@ func (e *Environment) closeAttach() {
 	stdout := e.stdout
 	taskIO := e.taskIO
 	pollStop := e.pollStop
+	oomStop := e.oomStop
 	e.stdin = nil
 	e.stdout = nil
 	e.taskIO = nil
 	e.task = nil
 	e.pollStop = nil
+	e.oomStop = nil
 	e.mu.Unlock()
 
 	if pollStop != nil {
 		pollStop()
+	}
+	if oomStop != nil {
+		oomStop()
 	}
 	if stdin != nil {
 		_ = stdin.Close()
@@ -215,6 +225,42 @@ func (e *Environment) closeAttach() {
 	if taskIO != nil {
 		taskIO.Cancel()
 		_ = taskIO.Close()
+	}
+}
+
+func (e *Environment) watchOOM(ctx context.Context) {
+	events, errs := e.client.Subscribe(e.context(ctx), `topic=="/tasks/oom"`)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, ok := <-errs:
+			if !ok {
+				return
+			}
+			if err != nil && !errors.Is(err, context.Canceled) {
+				e.log().WithField("error", err).Warn("containerd OOM event subscription stopped")
+			}
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if event == nil || event.Topic != ctrruntime.TaskOOMEventTopic {
+				continue
+			}
+			var oom eventtypes.TaskOOM
+			if err := typeurl.UnmarshalTo(event.Event, &oom); err != nil {
+				e.log().WithField("error", err).Warn("could not decode containerd OOM event")
+				continue
+			}
+			if oom.ContainerID != e.Id {
+				continue
+			}
+			e.mu.Lock()
+			e.lastOOM = true
+			e.mu.Unlock()
+		}
 	}
 }
 
