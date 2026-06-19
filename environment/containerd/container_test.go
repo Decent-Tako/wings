@@ -205,6 +205,28 @@ func TestImagePullContextPreservesCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestHostNetworkSpecOptsMountNameResolutionFiles(t *testing.T) {
+	var spec oci.Spec
+	for _, opt := range hostNetworkSpecOpts() {
+		if err := opt(context.Background(), nil, nil, &spec); err != nil {
+			t.Fatalf("hostNetworkSpecOpts() returned error: %v", err)
+		}
+	}
+
+	for _, expected := range []string{"/etc/hosts", "/etc/resolv.conf"} {
+		found := false
+		for _, mount := range spec.Mounts {
+			if mount.Destination == expected && mount.Source == expected && mount.Type == "bind" && strings.Join(mount.Options, ",") == "rbind,ro" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected host network spec opts to bind mount %s read-only, got %#v", expected, spec.Mounts)
+		}
+	}
+}
+
 func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	task := &fakeTask{waitErr: io.ErrClosedPipe}

@@ -61,13 +61,13 @@ func (e *Environment) Create() (err error) {
 		oci.WithDomainname(cfg.Docker.Domainname),
 		oci.WithTTY,
 		oci.WithMounts(e.ociMounts()),
-		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithNoNewPrivileges,
 		oci.WithRootFSReadonly(),
 		oci.WithUIDGID(e.containerUser()),
 		oci.WithDroppedCapabilities(containerdCapDrop()),
 		oci.WithAnnotations(labels),
 	}
+	specOpts = append(specOpts, hostNetworkSpecOpts()...)
 	specOpts = append(specOpts, resourceSpecOpts(e.Configuration.Limits())...)
 
 	snapshotID := e.snapshotID()
@@ -199,6 +199,14 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 	// No configured registry credentials matched. Leaving the resolver unset
 	// intentionally preserves containerd's default anonymous/public pull path.
 	return nil, false
+}
+
+func hostNetworkSpecOpts() []oci.SpecOpts {
+	return []oci.SpecOpts{
+		oci.WithHostNamespace(specs.NetworkNamespace),
+		oci.WithHostHostsFile,
+		oci.WithHostResolvconf,
+	}
 }
 
 func (e *Environment) validateHostNetworkingOnly() error {

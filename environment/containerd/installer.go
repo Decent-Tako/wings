@@ -82,9 +82,9 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		oci.WithHostname("installer"),
 		oci.WithTTY,
 		oci.WithMounts(installerMounts(spec)),
-		oci.WithHostNamespace(specs.NetworkNamespace),
 		oci.WithAnnotations(labels),
 	}
+	specOpts = append(specOpts, hostNetworkSpecOpts()...)
 	specOpts = append(specOpts, installerResourceSpecOpts(spec.Limits)...)
 
 	cfg := config.Get()
