@@ -16,6 +16,7 @@ import (
 type Factory struct{}
 
 var (
+	clientMu   sync.Mutex
 	clientOnce sync.Once
 	client     *containerdclient.Client
 	clientErr  error
@@ -52,11 +53,31 @@ func (Factory) NewInstaller() (environment.InstallationRunner, error) {
 	return NewInstaller()
 }
 
+func (Factory) Close() error {
+	return Close()
+}
+
 func Client() (*containerdclient.Client, error) {
+	clientMu.Lock()
+	defer clientMu.Unlock()
 	clientOnce.Do(func() {
 		client, clientErr = containerdclient.New(config.Get().Containerd.Address)
 	})
 	return client, errors.Wrap(clientErr, "environment/containerd: could not create client")
+}
+
+func Close() error {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+
+	var err error
+	if client != nil {
+		err = client.Close()
+	}
+	client = nil
+	clientErr = nil
+	clientOnce = sync.Once{}
+	return errors.Wrap(err, "environment/containerd: failed to close client")
 }
 
 func WithNamespace(ctx context.Context) context.Context {

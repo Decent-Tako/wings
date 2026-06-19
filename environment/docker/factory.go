@@ -22,3 +22,7 @@ func (Factory) NewProcess(id string, meta environment.ProcessMetadata, cfg *envi
 func (Factory) NewInstaller() (environment.InstallationRunner, error) {
 	return NewInstaller()
 }
+
+func (Factory) Close() error {
+	return nil
+}

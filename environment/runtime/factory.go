@@ -24,6 +24,7 @@ type Factory interface {
 	Configure(ctx context.Context) error
 	NewProcess(id string, meta environment.ProcessMetadata, cfg *environment.Configuration) (environment.ProcessEnvironment, error)
 	NewInstaller() (environment.InstallationRunner, error)
+	Close() error
 }
 
 func SelectedFactory() (Factory, error) {
@@ -99,6 +100,16 @@ func ConfigureSelected(ctx context.Context) error {
 		return err
 	}
 	return factory.Configure(ctx)
+}
+
+func CloseSelected() error {
+	selectedFactoryMu.RLock()
+	factory := selectedFactory
+	selectedFactoryMu.RUnlock()
+	if factory == nil {
+		return nil
+	}
+	return factory.Close()
 }
 
 func NewProcess(id string, meta environment.ProcessMetadata, cfg *environment.Configuration) (environment.ProcessEnvironment, error) {

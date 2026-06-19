@@ -197,6 +197,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		log.WithField("error", err).Fatal("failed to configure container runtime environment")
 		return
 	}
+	defer func() {
+		if err := envruntime.CloseSelected(); err != nil {
+			log.WithField("error", err).Warn("failed to close container runtime environment")
+		}
+	}()
 
 	if err := config.WriteToDisk(config.Get()); err != nil {
 		if !errors.Is(err, syscall.EROFS) {
