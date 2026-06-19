@@ -6,6 +6,7 @@ import (
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	"github.com/pelican-dev/wings/environment/containerd"
 	"github.com/pelican-dev/wings/environment/docker"
 )
 
@@ -22,6 +23,8 @@ func FactoryFor(name config.ContainerRuntime) (Factory, error) {
 	switch name {
 	case "", config.ContainerRuntimeDocker:
 		return docker.Factory{}, nil
+	case config.ContainerRuntimeContainerd:
+		return containerd.Factory{}, nil
 	default:
 		return nil, fmt.Errorf("environment/runtime: unsupported container runtime %q", name)
 	}

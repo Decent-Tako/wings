@@ -16,6 +16,16 @@ func TestFactoryForDefaultsToDocker(t *testing.T) {
 	}
 }
 
+func TestFactoryForContainerd(t *testing.T) {
+	factory, err := FactoryFor(config.ContainerRuntimeContainerd)
+	if err != nil {
+		t.Fatalf("expected containerd runtime to be supported: %v", err)
+	}
+	if factory == nil {
+		t.Fatal("expected containerd factory, got nil")
+	}
+}
+
 func TestFactoryForRejectsUnsupportedRuntime(t *testing.T) {
 	factory, err := FactoryFor(config.ContainerRuntime("bogus"))
 	if err == nil {
