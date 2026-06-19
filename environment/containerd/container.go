@@ -195,6 +195,8 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 		})
 		return containerdclient.WithResolver(resolver), true
 	}
+	// No configured registry credentials matched. Leaving the resolver unset
+	// intentionally preserves containerd's default anonymous/public pull path.
 	return nil, false
 }
 

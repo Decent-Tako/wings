@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/apex/log"
+
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
 	"github.com/pelican-dev/wings/environment/containerd"
@@ -12,9 +14,10 @@ import (
 )
 
 var (
-	selectedFactoryMu sync.RWMutex
-	selectedFactory   Factory
-	selectedRuntime   config.ContainerRuntime
+	selectedFactoryMu             sync.RWMutex
+	selectedFactory               Factory
+	selectedRuntime               config.ContainerRuntime
+	selectedRuntimeMismatchWarned bool
 )
 
 type Factory interface {
@@ -27,7 +30,9 @@ func SelectedFactory() (Factory, error) {
 	selectedFactoryMu.RLock()
 	if selectedFactory != nil {
 		factory := selectedFactory
+		runtime := selectedRuntime
 		selectedFactoryMu.RUnlock()
+		warnIfRuntimeChanged(runtime)
 		return factory, nil
 	}
 	selectedFactoryMu.RUnlock()
@@ -47,6 +52,7 @@ func FactoryFor(name config.ContainerRuntime) (Factory, error) {
 }
 
 func snapshotSelectedFactory(name config.ContainerRuntime) (Factory, error) {
+	name = normalizedRuntime(name)
 	factory, err := FactoryFor(name)
 	if err != nil {
 		return nil, err
@@ -58,11 +64,33 @@ func snapshotSelectedFactory(name config.ContainerRuntime) (Factory, error) {
 		return selectedFactory, nil
 	}
 	selectedFactory = factory
-	if name == "" {
-		name = config.ContainerRuntimeDocker
-	}
 	selectedRuntime = name
 	return selectedFactory, nil
+}
+
+func normalizedRuntime(name config.ContainerRuntime) config.ContainerRuntime {
+	if name == "" {
+		return config.ContainerRuntimeDocker
+	}
+	return name
+}
+
+func warnIfRuntimeChanged(snapshot config.ContainerRuntime) {
+	live := normalizedRuntime(config.Get().ContainerRuntime)
+	if live == snapshot {
+		return
+	}
+
+	selectedFactoryMu.Lock()
+	defer selectedFactoryMu.Unlock()
+	if selectedRuntimeMismatchWarned || selectedFactory == nil || selectedRuntime == live {
+		return
+	}
+	log.WithFields(log.Fields{
+		"selected_runtime":   selectedRuntime,
+		"configured_runtime": live,
+	}).Warn("container runtime configuration changed after runtime factory selection; continuing with snapshotted runtime")
+	selectedRuntimeMismatchWarned = true
 }
 
 func ConfigureSelected(ctx context.Context) error {
@@ -94,4 +122,5 @@ func resetSelectedFactoryForTest() {
 	defer selectedFactoryMu.Unlock()
 	selectedFactory = nil
 	selectedRuntime = ""
+	selectedRuntimeMismatchWarned = false
 }

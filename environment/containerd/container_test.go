@@ -132,6 +132,21 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 	}
 }
 
+func TestRegistryResolverOptSkipsUnmatchedPublicImage(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Get().Docker.Registries = map[string]config.RegistryConfiguration{
+		"registry.example.com/private": {Username: "user", Password: "pass"},
+	}
+
+	opt, ok := registryResolverOpt("docker.io/library/alpine:latest")
+	if ok {
+		t.Fatalf("expected public image not to use configured registry resolver, got %v", opt)
+	}
+	if opt != nil {
+		t.Fatalf("expected nil resolver opt for unmatched public image, got %v", opt)
+	}
+}
+
 func TestCreateCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	cli.loadErr = errdefs.ErrNotFound
