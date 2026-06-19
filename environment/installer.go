@@ -23,7 +23,8 @@ type InstallationSpec struct {
 
 // InstallationRunner owns the runtime-specific lifecycle for installer
 // containers while server.InstallationProcess owns the shared script and log
-// book-keeping.
+// book-keeping. Execute returns only after the installer process has exited and
+// the live output callback has consumed the runtime stream to EOF.
 type InstallationRunner interface {
 	PullImage(ctx context.Context, image string) error
 	Remove(ctx context.Context, id string) error

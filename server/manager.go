@@ -22,6 +22,11 @@ import (
 	"github.com/pelican-dev/wings/server/filesystem"
 )
 
+type persistedServerState struct {
+	State     string `json:"state"`
+	StartedAt string `json:"started_at,omitempty"`
+}
+
 type Manager struct {
 	mu      sync.RWMutex
 	client  remote.Client
@@ -146,9 +151,15 @@ func (m *Manager) Remove(filter func(match *Server) bool) {
 // at once. It is fine if this file falls slightly out of sync, it is just here
 // to make recovering from an unexpected system reboot a little easier.
 func (m *Manager) PersistStates() error {
-	states := map[string]string{}
+	states := map[string]persistedServerState{}
 	for _, s := range m.All() {
-		states[s.ID()] = s.Environment.State()
+		state := persistedServerState{State: s.Environment.State()}
+		if startedAtState, ok := s.Environment.(environment.StartedAtState); ok {
+			if startedAt, ok := startedAtState.StartedAt(); ok {
+				state.StartedAt = startedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		states[s.ID()] = state
 	}
 	data, err := json.Marshal(states)
 	if err != nil {
@@ -167,18 +178,51 @@ func (m *Manager) ReadStates() (map[string]string, error) {
 		return nil, errors.WithStack(err)
 	}
 	defer f.Close()
-	var states map[string]string
-	if err := json.NewDecoder(f).Decode(&states); err != nil && err != io.EOF {
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	states, err := decodePersistedServerStates(data)
+	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	out := make(map[string]string, 0)
 	// Only return states for servers that we're currently tracking in the system.
 	for id, state := range states {
-		if _, ok := m.Get(id); ok {
-			out[id] = state
+		if server, ok := m.Get(id); ok {
+			out[id] = state.State
+			if state.StartedAt != "" {
+				if startedAt, err := time.Parse(time.RFC3339Nano, state.StartedAt); err == nil {
+					if startedAtState, ok := server.Environment.(environment.StartedAtState); ok {
+						startedAtState.RestoreStartedAt(startedAt)
+					}
+				} else {
+					server.Log().WithField("value", state.StartedAt).WithField("error", err).Warn("invalid started_at value in server state file")
+				}
+			}
 		}
 	}
 	return out, nil
+}
+
+func decodePersistedServerStates(data []byte) (map[string]persistedServerState, error) {
+	if len(data) == 0 {
+		return map[string]persistedServerState{}, nil
+	}
+	var states map[string]persistedServerState
+	if err := json.Unmarshal(data, &states); err == nil {
+		return states, nil
+	}
+
+	var legacy map[string]string
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil, err
+	}
+	states = make(map[string]persistedServerState, len(legacy))
+	for id, state := range legacy {
+		states[id] = persistedServerState{State: state}
+	}
+	return states, nil
 }
 
 // InitServer initializes a server using a data byte array. This will be

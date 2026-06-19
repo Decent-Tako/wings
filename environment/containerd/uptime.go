@@ -13,6 +13,21 @@ func (e *Environment) setStartedAt(ctx context.Context, t time.Time) {
 	e.persistStartedAt(ctx, t)
 }
 
+func (e *Environment) StartedAt() (time.Time, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.startedAt, !e.startedAt.IsZero()
+}
+
+func (e *Environment) RestoreStartedAt(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	e.mu.Lock()
+	e.startedAt = t.UTC()
+	e.mu.Unlock()
+}
+
 func (e *Environment) startedAtOrRestore(ctx context.Context, fallback time.Time) time.Time {
 	e.mu.RLock()
 	startedAt := e.startedAt

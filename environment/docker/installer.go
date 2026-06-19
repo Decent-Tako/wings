@@ -175,21 +175,27 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		return "", err
 	}
 
+	streamDone := make(chan error, 1)
 	go func(id string) {
-		if err := i.streamOutput(ctx, id, output); err != nil {
-			log.WithFields(log.Fields{"container_id": id, "error": err}).Warn("error connecting to server install stream output")
-		}
+		streamDone <- i.streamOutput(ctx, id, output)
 	}(r.ID)
 
 	sChan, eChan := i.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-eChan:
 		if err != nil {
+			cancel()
+			if streamErr := <-streamDone; streamErr != nil {
+				log.WithFields(log.Fields{"container_id": r.ID, "error": streamErr}).Warn("error connecting to server install stream output")
+			}
 			return "", err
 		}
 	case <-sChan:
 	}
 
+	if streamErr := <-streamDone; streamErr != nil {
+		log.WithFields(log.Fields{"container_id": r.ID, "error": streamErr}).Warn("error connecting to server install stream output")
+	}
 	return r.ID, nil
 }
 

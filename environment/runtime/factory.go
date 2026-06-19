@@ -3,11 +3,18 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
 	"github.com/pelican-dev/wings/environment/containerd"
 	"github.com/pelican-dev/wings/environment/docker"
+)
+
+var (
+	selectedFactoryMu sync.RWMutex
+	selectedFactory   Factory
+	selectedRuntime   config.ContainerRuntime
 )
 
 type Factory interface {
@@ -17,7 +24,15 @@ type Factory interface {
 }
 
 func SelectedFactory() (Factory, error) {
-	return FactoryFor(config.Get().ContainerRuntime)
+	selectedFactoryMu.RLock()
+	if selectedFactory != nil {
+		factory := selectedFactory
+		selectedFactoryMu.RUnlock()
+		return factory, nil
+	}
+	selectedFactoryMu.RUnlock()
+
+	return snapshotSelectedFactory(config.Get().ContainerRuntime)
 }
 
 func FactoryFor(name config.ContainerRuntime) (Factory, error) {
@@ -29,6 +44,25 @@ func FactoryFor(name config.ContainerRuntime) (Factory, error) {
 	default:
 		return nil, fmt.Errorf("environment/runtime: unsupported container runtime %q", name)
 	}
+}
+
+func snapshotSelectedFactory(name config.ContainerRuntime) (Factory, error) {
+	factory, err := FactoryFor(name)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedFactoryMu.Lock()
+	defer selectedFactoryMu.Unlock()
+	if selectedFactory != nil {
+		return selectedFactory, nil
+	}
+	selectedFactory = factory
+	if name == "" {
+		name = config.ContainerRuntimeDocker
+	}
+	selectedRuntime = name
+	return selectedFactory, nil
 }
 
 func ConfigureSelected(ctx context.Context) error {
@@ -53,4 +87,11 @@ func NewInstaller() (environment.InstallationRunner, error) {
 		return nil, err
 	}
 	return factory.NewInstaller()
+}
+
+func resetSelectedFactoryForTest() {
+	selectedFactoryMu.Lock()
+	defer selectedFactoryMu.Unlock()
+	selectedFactory = nil
+	selectedRuntime = ""
 }

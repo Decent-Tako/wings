@@ -83,7 +83,9 @@ func (e *Environment) Attach(ctx context.Context) error {
 	exitC, err := task.Wait(e.context(ctx))
 	if err != nil {
 		if createdTask {
-			_, _ = task.Delete(e.context(context.Background()), containerdclient.WithProcessKill)
+			if _, cleanupErr := task.Delete(e.context(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
+				warnContainerdCleanupError(e.log(), cleanupErr, "failed to delete containerd task after attach wait error")
+			}
 		}
 		_ = stdinR.Close()
 		_ = stdinW.Close()
@@ -190,7 +192,9 @@ func (e *Environment) watchExit(exitC <-chan containerdclient.ExitStatus, task c
 	e.lastExitTime = exitedAt
 	e.mu.Unlock()
 
-	_, _ = task.Delete(e.context(context.Background()))
+	if _, err := task.Delete(e.context(context.Background())); err != nil {
+		warnContainerdCleanupError(e.log(), err, "failed to delete exited containerd task")
+	}
 	e.closeAttach()
 	e.SetState(environment.ProcessOfflineState)
 }

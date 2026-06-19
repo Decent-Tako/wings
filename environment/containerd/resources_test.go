@@ -1,7 +1,11 @@
 package containerd
 
 import (
+	"context"
 	"testing"
+
+	"github.com/containerd/containerd/v2/pkg/oci"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
@@ -41,5 +45,41 @@ func TestLinuxResourcesMapsBasicLimits(t *testing.T) {
 	}
 	if resources.BlockIO == nil || resources.BlockIO.Weight == nil || *resources.BlockIO.Weight != 500 {
 		t.Fatalf("expected block IO weight to be set, got %+v", resources.BlockIO)
+	}
+}
+
+func TestResourceSpecOptsApplyCompleteLinuxResources(t *testing.T) {
+	reservation := int64(256 * 1024 * 1024)
+	limit := int64(512 * 1024 * 1024)
+	swap := int64(768 * 1024 * 1024)
+	disableOOMKiller := true
+	resources := &specs.LinuxResources{
+		Memory: &specs.LinuxMemory{
+			Reservation:      &reservation,
+			Limit:            &limit,
+			Swap:             &swap,
+			DisableOOMKiller: &disableOOMKiller,
+		},
+	}
+	spec := oci.Spec{
+		Version: specs.Version,
+		Linux:   &specs.Linux{},
+	}
+
+	for _, opt := range resourceSpecOptsFrom(resources) {
+		if err := opt(context.Background(), nil, nil, &spec); err != nil {
+			t.Fatalf("resource spec opt returned error: %v", err)
+		}
+	}
+
+	if spec.Linux.Resources == nil || spec.Linux.Resources.Memory == nil {
+		t.Fatal("expected Linux memory resources to be applied")
+	}
+	memory := spec.Linux.Resources.Memory
+	if memory.Reservation == nil || *memory.Reservation != reservation {
+		t.Fatalf("expected memory reservation %d, got %+v", reservation, memory.Reservation)
+	}
+	if memory.DisableOOMKiller == nil || *memory.DisableOOMKiller != disableOOMKiller {
+		t.Fatalf("expected DisableOOMKiller %v, got %+v", disableOOMKiller, memory.DisableOOMKiller)
 	}
 }

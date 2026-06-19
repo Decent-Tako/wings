@@ -15,13 +15,25 @@ func (e *Environment) OnBeforeStart(ctx context.Context) error {
 	if err := e.removeContainer(ctx); err != nil {
 		return errors.Wrap(err, "environment/containerd: failed to remove container during pre-boot")
 	}
-	return e.Create()
+	if err := e.Create(); err != nil {
+		if cleanupErr := e.removeContainer(context.Background()); cleanupErr != nil {
+			e.log().WithField("error", cleanupErr).Warn("failed to cleanup partially created containerd container after create error")
+		}
+		return err
+	}
+	return nil
 }
 
 func (e *Environment) Start(ctx context.Context) error {
 	sawError := false
+	createdEnvironment := false
 	defer func() {
 		if sawError {
+			if createdEnvironment {
+				if err := e.removeContainer(context.Background()); err != nil {
+					e.log().WithField("error", err).Warn("failed to cleanup containerd container after start error")
+				}
+			}
 			e.SetState(environment.ProcessStoppingState)
 			e.SetState(environment.ProcessOfflineState)
 		}
@@ -47,6 +59,7 @@ func (e *Environment) Start(ctx context.Context) error {
 	if err := e.OnBeforeStart(ctx); err != nil {
 		return errors.Wrap(err, "environment/containerd: failed to run pre-boot process")
 	}
+	createdEnvironment = true
 
 	actx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
@@ -54,16 +67,18 @@ func (e *Environment) Start(ctx context.Context) error {
 		return errors.Wrap(err, "environment/containerd: failed to attach to task")
 	}
 
-	e.mu.RLock()
+	e.mu.Lock()
 	task := e.task
-	e.mu.RUnlock()
 	if task == nil {
+		e.mu.Unlock()
 		return errors.New("environment/containerd: no task available after attach")
 	}
 
 	if err := task.Start(e.context(actx)); err != nil {
+		e.mu.Unlock()
 		return errors.Wrap(err, "environment/containerd: failed to start task")
 	}
+	e.mu.Unlock()
 
 	e.setStartedAt(actx, time.Now())
 	e.mu.Lock()

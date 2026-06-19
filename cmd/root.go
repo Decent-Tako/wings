@@ -45,6 +45,8 @@ var (
 	debug      = false
 )
 
+var errDockerSnap = errors.New("Docker Snap installation detected")
+
 var rootCommand = &cobra.Command{
 	Use:   "wings",
 	Short: "Runs the API server allowing programmatic control of game servers for Pelican Panel.",
@@ -93,21 +95,36 @@ func init() {
 	rootCommand.AddCommand(newSelfupdateCommand())
 }
 
-func isDockerSnap() bool {
+func isDockerSnap() (bool, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatalf("Unable to initialize Docker client: %s", err)
+		return false, fmt.Errorf("unable to initialize Docker client: %w", err)
 	}
 
 	defer cli.Close() // Close the client when the function returns (should not be needed, but just to be safe)
 
 	info, err := cli.Info(context.Background())
 	if err != nil {
-		log.Fatalf("Unable to get Docker info: %s", err)
+		return false, fmt.Errorf("unable to get Docker info: %w", err)
 	}
 
 	// Check if Docker root directory contains '/var/snap/docker'
-	return strings.Contains(info.DockerRootDir, "/var/snap/docker")
+	return strings.Contains(info.DockerRootDir, "/var/snap/docker"), nil
+}
+
+func runDockerStartupChecks(runtime config.ContainerRuntime, snapCheck func() (bool, error)) error {
+	if runtime != "" && runtime != config.ContainerRuntimeDocker {
+		return nil
+	}
+
+	ok, err := snapCheck()
+	if err != nil {
+		return err
+	}
+	if ok {
+		return errDockerSnap
+	}
+	return nil
 }
 
 func rootCmdRun(cmd *cobra.Command, _ []string) {
@@ -115,9 +132,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	log.Debug("running in debug mode")
 	log.WithField("config_file", configPath).Info("loading configuration from file")
 
-	if isDockerSnap() {
-		log.Error("Docker Snap installation detected. Exiting...")
-		os.Exit(1)
+	if err := runDockerStartupChecks(config.Get().ContainerRuntime, isDockerSnap); err != nil {
+		if errors.Is(err, errDockerSnap) {
+			log.WithField("error", err).Fatal("Docker Snap installation detected. Exiting...")
+		}
+		log.WithField("error", err).Fatal("failed Docker startup checks")
 	}
 
 	if ok, _ := cmd.Flags().GetBool("ignore-certificate-errors"); ok {

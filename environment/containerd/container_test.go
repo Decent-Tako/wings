@@ -73,10 +73,12 @@ func TestCreateRejectsUnsupportedContainerdNetworking(t *testing.T) {
 	t.Run("non host mode", func(t *testing.T) {
 		env, cli := newContainerdTestEnvironment(t)
 		cli.loadErr = errdefs.ErrNotFound
-		config.Get().Docker.Network.Mode = "pelican"
+		config.Update(func(c *config.Configuration) {
+			c.Containerd.Network.Mode = "bridge"
+		})
 
 		err := env.Create()
-		if err == nil || !strings.Contains(err.Error(), "host networking only") {
+		if err == nil || !strings.Contains(err.Error(), "containerd.network.mode") {
 			t.Fatalf("expected host networking validation error, got %v", err)
 		}
 	})
@@ -98,7 +100,9 @@ func TestCreateRejectsUnsupportedContainerdNetworking(t *testing.T) {
 	t.Run("macvlan", func(t *testing.T) {
 		env, cli := newContainerdTestEnvironment(t)
 		cli.loadErr = errdefs.ErrNotFound
-		config.Get().Docker.Network.Driver = "macvlan"
+		config.Update(func(c *config.Configuration) {
+			c.Containerd.Network.Mode = "macvlan"
+		})
 
 		err := env.Create()
 		if err == nil || !strings.Contains(err.Error(), "macvlan") {
@@ -209,6 +213,52 @@ func TestTerminateKillsRunningTaskAndSetsOffline(t *testing.T) {
 	}
 	if env.State() != environment.ProcessOfflineState {
 		t.Fatalf("expected offline state after terminate, got %q", env.State())
+	}
+}
+
+func TestStartCleansCreatedTaskAndContainerWhenStartFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{startErr: io.ErrClosedPipe}
+	container := &fakeContainer{
+		id:      env.Id,
+		taskErr: errdefs.ErrNotFound,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli.loadErr = errdefs.ErrNotFound
+	cli.container = container
+
+	err := env.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed to start task") {
+		t.Fatalf("expected task start error, got %v", err)
+	}
+	if task.deleteCalls == 0 {
+		t.Fatal("expected failed start to delete the created task")
+	}
+	if !container.deleted {
+		t.Fatal("expected failed start to delete the container with snapshot cleanup")
+	}
+	if env.IsAttached() {
+		t.Fatal("expected failed start to close attach state")
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected failed start to leave environment offline, got %q", env.State())
+	}
+}
+
+func TestRestoredStartedAtTakesPrecedenceOverContainerLabel(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	stateStartedAt := time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC)
+	labelTime := time.Date(2026, 6, 19, 7, 0, 0, 0, time.UTC)
+	cli.container = &fakeContainer{
+		id:     env.Id,
+		labels: map[string]string{labelStartedAt: labelTime.Format(time.RFC3339Nano)},
+	}
+
+	env.RestoreStartedAt(stateStartedAt)
+	got := env.startedAtOrRestore(context.Background(), time.Now())
+	if !got.Equal(stateStartedAt) {
+		t.Fatalf("expected state-file started_at %s to win over label, got %s", stateStartedAt, got)
 	}
 }
 
@@ -521,8 +571,11 @@ type fakeTask struct {
 	metricErr error
 
 	startCalls  int
+	startErr    error
 	deleteCalls int
+	deleteErr   error
 	killed      []syscall.Signal
+	killErr     error
 }
 
 func (f *fakeTask) ID() string { return "test-server" }
@@ -531,18 +584,27 @@ func (f *fakeTask) Pid() uint32 { return 1234 }
 
 func (f *fakeTask) Start(context.Context) error {
 	f.startCalls++
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.status = containerdclient.Running
 	return nil
 }
 
 func (f *fakeTask) Delete(context.Context, ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
 	f.deleteCalls++
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
 	f.status = containerdclient.Stopped
 	return containerdclient.NewExitStatus(0, time.Now(), nil), nil
 }
 
 func (f *fakeTask) Kill(_ context.Context, signal syscall.Signal, _ ...containerdclient.KillOpts) error {
 	f.killed = append(f.killed, signal)
+	if f.killErr != nil {
+		return f.killErr
+	}
 	f.status = containerdclient.Stopped
 	return nil
 }

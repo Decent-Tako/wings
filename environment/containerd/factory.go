@@ -23,8 +23,8 @@ var (
 
 func (Factory) Configure(ctx context.Context) error {
 	cfg := config.Get().Containerd
-	if config.Get().Docker.Network.Mode != "host" {
-		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set docker.network.network_mode to %q until the later CNI/portmap implementation lands", "host")
+	if cfg.Network.Mode != "host" {
+		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set containerd.network.mode to %q until the later CNI/portmap implementation lands", "host")
 	}
 	for _, dir := range []string{cfg.RuntimeRoot, cfg.LogDirectory} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

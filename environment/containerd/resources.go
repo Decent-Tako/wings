@@ -1,8 +1,10 @@
 package containerd
 
 import (
+	"context"
 	"os"
 
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
@@ -23,33 +25,17 @@ func installerResourceSpecOpts(l environment.Limits) []oci.SpecOpts {
 }
 
 func resourceSpecOptsFrom(resources *specs.LinuxResources) []oci.SpecOpts {
-	opts := []oci.SpecOpts{}
-	if resources.Memory != nil {
-		if resources.Memory.Limit != nil {
-			opts = append(opts, oci.WithMemoryLimit(uint64(*resources.Memory.Limit)))
+	return []oci.SpecOpts{withLinuxResources(resources)}
+}
+
+func withLinuxResources(resources *specs.LinuxResources) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
 		}
-		if resources.Memory.Swap != nil {
-			opts = append(opts, oci.WithMemorySwap(*resources.Memory.Swap))
-		}
+		s.Linux.Resources = resources
+		return nil
 	}
-	if resources.Pids != nil && resources.Pids.Limit != nil && *resources.Pids.Limit > 0 {
-		opts = append(opts, oci.WithPidsLimit(*resources.Pids.Limit))
-	}
-	if resources.CPU != nil {
-		if resources.CPU.Quota != nil && resources.CPU.Period != nil {
-			opts = append(opts, oci.WithCPUCFS(*resources.CPU.Quota, *resources.CPU.Period))
-		}
-		if resources.CPU.Shares != nil {
-			opts = append(opts, oci.WithCPUShares(*resources.CPU.Shares))
-		}
-		if resources.CPU.Cpus != "" {
-			opts = append(opts, oci.WithCPUs(resources.CPU.Cpus))
-		}
-	}
-	if resources.BlockIO != nil {
-		opts = append(opts, oci.WithBlockIO(resources.BlockIO))
-	}
-	return opts
 }
 
 func linuxResources(l environment.Limits) *specs.LinuxResources {

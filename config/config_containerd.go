@@ -42,4 +42,14 @@ type ContainerdConfiguration struct {
 
 	// LogMaxFiles controls how many rotated log files are kept per container.
 	LogMaxFiles int `default:"1" json:"log_max_files" yaml:"log_max_files"`
+
+	// Network contains containerd-specific networking configuration. Only host
+	// networking is supported until CNI/portmap support lands.
+	Network ContainerdNetworkConfiguration `json:"network" yaml:"network"`
+}
+
+type ContainerdNetworkConfiguration struct {
+	// Mode is the network namespace mode to use for containerd-backed servers.
+	// Only "host" is currently supported.
+	Mode string `default:"host" json:"mode" yaml:"mode"`
 }

@@ -81,6 +81,9 @@ func (e *Environment) Create() error {
 		containerdclient.WithRuntime(cfg.Containerd.Runtime, nil),
 		containerdclient.WithContainerLabels(labels),
 	); err != nil {
+		if cleanupErr := e.removeContainer(context.Background()); cleanupErr != nil {
+			e.log().WithField("error", cleanupErr).Warn("failed to cleanup partially created containerd container after create error")
+		}
 		return errors.Wrap(err, "environment/containerd: failed to create container")
 	}
 
@@ -185,15 +188,16 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 
 func (e *Environment) validateHostNetworkingOnly() error {
 	allocations := e.Configuration.Allocations()
+	mode := config.Get().Containerd.Network.Mode
 	// TODO(T5): replace this guard with CNI/portmap configuration reconciliation
 	// when containerd networking supports Wings' Docker bridge behavior.
-	if config.Get().Docker.Network.Mode != "host" {
-		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set docker.network.network_mode to %q until the later CNI/portmap implementation lands", "host")
+	if mode != "host" {
+		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set containerd.network.mode to %q until the later CNI/portmap implementation lands", "host")
 	}
 	if allocations.ForceOutgoingIP {
 		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: force_outgoing_ip requires the later CNI/SNAT implementation")
 	}
-	if config.Get().Docker.Network.Driver == "macvlan" {
+	if mode == "macvlan" {
 		return errors.Wrap(ErrUnsupportedNetwork, "environment/containerd: macvlan requires the later CNI implementation")
 	}
 	return nil
@@ -265,17 +269,20 @@ func (e *Environment) removeContainer(ctx context.Context) error {
 	}
 
 	task, err := c.Task(ctx, nil)
+	var firstErr error
 	if err == nil {
-		_, _ = task.Delete(ctx, containerdclient.WithProcessKill)
+		if _, err := task.Delete(ctx, containerdclient.WithProcessKill); err != nil {
+			firstErr = warnContainerdCleanupError(e.log(), err, "failed to delete containerd task during container removal")
+		}
 	} else if !errdefs.IsNotFound(err) {
 		return err
 	}
 
 	e.closeAttach()
-	if err := c.Delete(ctx, containerdclient.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
-		return err
+	if err := c.Delete(ctx, containerdclient.WithSnapshotCleanup); err != nil {
+		return warnContainerdCleanupError(e.log(), err, "failed to delete containerd container during container removal")
 	}
-	return nil
+	return firstErr
 }
 
 func (e *Environment) decodeMetric(metric *apitypes.Metric) (uint64, uint64) {

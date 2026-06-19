@@ -48,8 +48,11 @@ func (i *Installer) Remove(ctx context.Context, id string) error {
 		return err
 	}
 
+	var firstErr error
 	if task, err := c.Task(WithNamespace(ctx), nil); err == nil {
-		_, _ = task.Delete(WithNamespace(ctx), containerdclient.WithProcessKill)
+		if _, err := task.Delete(WithNamespace(ctx), containerdclient.WithProcessKill); err != nil {
+			firstErr = warnContainerdCleanupError(log.WithField("installer_id", id), err, "failed to delete containerd installer task during removal")
+		}
 	} else if !errdefs.IsNotFound(err) {
 		return err
 	}
@@ -58,7 +61,7 @@ func (i *Installer) Remove(ctx context.Context, id string) error {
 		return err
 	}
 	_ = os.Remove(i.logPath(id))
-	return nil
+	return firstErr
 }
 
 func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSpec, output func([]byte)) (string, error) {
@@ -73,8 +76,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		"ContainerType": "server_installer",
 	}
 	specOpts := []oci.SpecOpts{
-		oci.WithImageConfig(image),
-		oci.WithProcessArgs(spec.Entrypoint, spec.ScriptPath),
+		oci.WithImageConfigArgs(image, []string{spec.Entrypoint, spec.ScriptPath}),
 		oci.WithEnv(spec.Env),
 		oci.WithHostname("installer"),
 		oci.WithTTY,
@@ -97,6 +99,9 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		containerdclient.WithContainerLabels(labels),
 	)
 	if err != nil {
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup partially created containerd installer container")
+		}
 		return "", errors.Wrap(err, "environment/containerd: failed to create installer container")
 	}
 
@@ -108,6 +113,9 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		_ = stdinW.Close()
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after log open error")
+		}
 		return "", err
 	}
 
@@ -123,17 +131,25 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
 		_ = logWriter.Close()
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after task create error")
+		}
 		return "", errors.Wrap(err, "environment/containerd: failed to create installer task")
 	}
 
 	exitC, err := task.Wait(ctx)
 	if err != nil {
-		_, _ = task.Delete(WithNamespace(context.Background()), containerdclient.WithProcessKill)
+		if _, cleanupErr := task.Delete(WithNamespace(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
+			warnContainerdCleanupError(log.WithField("installer_id", spec.ID), cleanupErr, "failed to delete containerd installer task after wait error")
+		}
 		_ = stdinR.Close()
 		_ = stdinW.Close()
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
 		_ = logWriter.Close()
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after wait error")
+		}
 		return "", errors.Wrap(err, "environment/containerd: failed to wait on installer task")
 	}
 
@@ -154,14 +170,25 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}()
 
 	if err := task.Start(ctx); err != nil {
+		if _, cleanupErr := task.Delete(WithNamespace(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
+			warnContainerdCleanupError(log.WithField("installer_id", spec.ID), cleanupErr, "failed to delete containerd installer task after start error")
+		}
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after start error")
+		}
 		return "", errors.Wrap(err, "environment/containerd: failed to start installer task")
 	}
 
 	status := <-exitC
 	if _, _, err := status.Result(); err != nil {
+		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
+			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after installer error")
+		}
 		return "", errors.Wrap(err, "environment/containerd: installer task exited with an error")
 	}
-	_, _ = task.Delete(ctx)
+	if _, err := task.Delete(ctx); err != nil {
+		warnContainerdCleanupError(log.WithField("installer_id", spec.ID), err, "failed to delete exited containerd installer task")
+	}
 	_ = stdoutW.Close()
 	<-done
 	return spec.ID, nil
