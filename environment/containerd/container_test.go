@@ -487,6 +487,34 @@ func TestInstallerExecuteCleansTaskAndContainerWhenStartFails(t *testing.T) {
 	}
 }
 
+func TestInstallerExecuteReturnsErrorForNonZeroExitCode(t *testing.T) {
+	newContainerdTestConfig(t)
+	spec := newContainerdTestInstallationSpec(t)
+	task := &fakeTask{waitCh: make(chan containerdclient.ExitStatus, 1)}
+	task.waitCh <- *containerdclient.NewExitStatus(42, time.Now(), nil)
+	container := &fakeContainer{
+		id:      spec.ID,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli := &fakeClient{
+		container: container,
+		getImage:  fakeImage{name: spec.Image},
+	}
+	installer := &Installer{client: cli}
+
+	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	if err == nil || !strings.Contains(err.Error(), "exited with code 42") {
+		t.Fatalf("expected non-zero installer exit error, got %v", err)
+	}
+	if task.deleteCalls == 0 {
+		t.Fatal("expected exited installer task to be deleted")
+	}
+	if !container.deleted {
+		t.Fatal("expected failed installer container to be removed")
+	}
+}
+
 func TestRestoredStartedAtTakesPrecedenceOverContainerLabel(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	stateStartedAt := time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC)

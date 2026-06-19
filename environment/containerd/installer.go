@@ -177,11 +177,15 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}
 
 	status := <-exitC
-	if _, _, err := status.Result(); err != nil {
+	code, _, err := status.Result()
+	if err != nil {
 		return "", errors.Wrap(err, "environment/containerd: installer task exited with an error")
 	}
 	if _, err := task.Delete(ctx); err != nil {
 		warnContainerdCleanupError(log.WithField("installer_id", spec.ID), err, "failed to delete exited containerd installer task")
+	}
+	if code != 0 {
+		return "", errors.Errorf("environment/containerd: installer task exited with code %d", code)
 	}
 	return spec.ID, nil
 }

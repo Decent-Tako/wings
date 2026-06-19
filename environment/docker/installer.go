@@ -181,6 +181,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}(r.ID)
 
 	sChan, eChan := i.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
+	var waitStatus container.WaitResponse
 	select {
 	case err := <-eChan:
 		if err != nil {
@@ -190,11 +191,14 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 			}
 			return "", err
 		}
-	case <-sChan:
+	case waitStatus = <-sChan:
 	}
 
 	if streamErr := <-streamDone; streamErr != nil {
 		log.WithFields(log.Fields{"container_id": r.ID, "error": streamErr}).Warn("error connecting to server install stream output")
+	}
+	if err := installerExitError(waitStatus); err != nil {
+		return "", err
 	}
 	return r.ID, nil
 }
@@ -226,4 +230,14 @@ func (i *Installer) streamOutput(ctx context.Context, id string, output func([]b
 		return err
 	}
 	return nil
+}
+
+func installerExitError(status container.WaitResponse) error {
+	if status.StatusCode == 0 {
+		return nil
+	}
+	if status.Error != nil && status.Error.Message != "" {
+		return errors.Errorf("environment/docker: installer container exited with code %d: %s", status.StatusCode, status.Error.Message)
+	}
+	return errors.Errorf("environment/docker: installer container exited with code %d", status.StatusCode)
 }
