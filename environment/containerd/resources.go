@@ -45,14 +45,20 @@ func linuxResources(l environment.Limits) *specs.LinuxResources {
 	oomDisabled := !l.OOMKiller
 	pids := l.ProcessLimit()
 
+	memory := &specs.LinuxMemory{
+		DisableOOMKiller: &oomDisabled,
+	}
+	if l.MemoryLimit > 0 {
+		memory.Limit = &limit
+		memory.Reservation = &reservation
+	}
+	if swap > 0 || l.Swap < 0 {
+		memory.Swap = &swap
+	}
+
 	resources := &specs.LinuxResources{
-		Memory: &specs.LinuxMemory{
-			Limit:            &limit,
-			Reservation:      &reservation,
-			Swap:             &swap,
-			DisableOOMKiller: &oomDisabled,
-		},
-		Pids: &specs.LinuxPids{Limit: &pids},
+		Memory: memory,
+		Pids:   &specs.LinuxPids{Limit: &pids},
 	}
 
 	if l.CpuLimit > 0 {

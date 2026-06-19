@@ -48,6 +48,54 @@ func TestLinuxResourcesMapsBasicLimits(t *testing.T) {
 	}
 }
 
+func TestLinuxResourcesOmitsUnsetMemoryLimits(t *testing.T) {
+	cfg, err := config.NewAtPath("/tmp/wings.yml")
+	if err != nil {
+		t.Fatalf("failed to create config: %v", err)
+	}
+	config.Set(cfg)
+
+	resources := linuxResources(environment.Limits{
+		MemoryLimit: 0,
+		Swap:        0,
+		OOMKiller:   true,
+	})
+
+	if resources.Memory == nil {
+		t.Fatal("expected memory resource block for OOM setting")
+	}
+	if resources.Memory.Limit != nil {
+		t.Fatalf("expected unset memory limit to be omitted, got %d", *resources.Memory.Limit)
+	}
+	if resources.Memory.Reservation != nil {
+		t.Fatalf("expected unset memory reservation to be omitted, got %d", *resources.Memory.Reservation)
+	}
+	if resources.Memory.Swap != nil {
+		t.Fatalf("expected unset swap to be omitted, got %d", *resources.Memory.Swap)
+	}
+}
+
+func TestLinuxResourcesPreservesExplicitUnlimitedSwap(t *testing.T) {
+	cfg, err := config.NewAtPath("/tmp/wings.yml")
+	if err != nil {
+		t.Fatalf("failed to create config: %v", err)
+	}
+	config.Set(cfg)
+
+	resources := linuxResources(environment.Limits{
+		MemoryLimit: 512,
+		Swap:        -1,
+		OOMKiller:   true,
+	})
+
+	if resources.Memory == nil || resources.Memory.Swap == nil {
+		t.Fatal("expected explicit unlimited swap to be set")
+	}
+	if got := *resources.Memory.Swap; got != -1 {
+		t.Fatalf("expected unlimited swap sentinel -1, got %d", got)
+	}
+}
+
 func TestResourceSpecOptsApplyCompleteLinuxResources(t *testing.T) {
 	reservation := int64(256 * 1024 * 1024)
 	limit := int64(512 * 1024 * 1024)
