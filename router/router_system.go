@@ -22,7 +22,7 @@ import (
 
 // Returns information about the system that wings is running on.
 func getSystemInformation(c *gin.Context) {
-	i, err := system.GetSystemInformation()
+	i, err := system.GetSystemInformation(string(config.Get().ContainerRuntime))
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
