@@ -142,9 +142,11 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 
 func TestRegistryResolverOptSkipsUnmatchedPublicImage(t *testing.T) {
 	newContainerdTestConfig(t)
-	config.Get().Docker.Registries = map[string]config.RegistryConfiguration{
-		"registry.example.com/private": {Username: "user", Password: "pass"},
-	}
+	config.Update(func(c *config.Configuration) {
+		c.Docker.Registries = map[string]config.RegistryConfiguration{
+			"registry.example.com/private": {Username: "user", Password: "pass"},
+		}
+	})
 
 	opt, ok := registryResolverOpt("docker.io/library/alpine:latest")
 	if ok {
@@ -678,8 +680,10 @@ func TestPollResourcesPublishesStatsWithUnsupportedNetwork(t *testing.T) {
 
 func TestReadlogTailsRotatedLogs(t *testing.T) {
 	env, _ := newContainerdTestEnvironment(t)
-	config.Get().Containerd.LogMaxSize = "12b"
-	config.Get().Containerd.LogMaxFiles = 3
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.LogMaxSize = "12b"
+		c.Containerd.LogMaxFiles = 3
+	})
 
 	writer, err := newRotatingLogWriter(env.logPath())
 	if err != nil {
@@ -726,7 +730,6 @@ func newContainerdTestEnvironment(t *testing.T) (*Environment, *fakeClient) {
 	}, []string{"SERVER_MEMORY=128"})
 
 	cli := &fakeClient{
-		loadErr:   errdefs.ErrNotFound,
 		pullImage: fakeImage{name: "example.com/server:latest"},
 		events:    make(chan *ctrevents.Envelope),
 		errs:      make(chan error),
