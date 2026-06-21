@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -40,10 +39,15 @@ func (i *Installer) PullImage(ctx context.Context, image string) error {
 }
 
 func (i *Installer) Remove(ctx context.Context, id string) error {
+	logPath, err := i.logPath(id)
+	if err != nil {
+		return err
+	}
+
 	c, err := i.client.LoadContainer(WithNamespace(ctx), id)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			_ = os.Remove(i.logPath(id))
+			_ = os.Remove(logPath)
 			return nil
 		}
 		return err
@@ -61,7 +65,7 @@ func (i *Installer) Remove(ctx context.Context, id string) error {
 	if err := c.Delete(WithNamespace(ctx), containerdclient.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
-	_ = os.Remove(i.logPath(id))
+	_ = os.Remove(logPath)
 	return firstErr
 }
 
@@ -140,8 +144,12 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}
 	defer logWriter.Close()
 
+	fifoRoot, err := containerdFIFORoot()
+	if err != nil {
+		return "", err
+	}
 	ioOpts := []cio.Opt{
-		cio.WithFIFODir(filepath.Join(config.Get().Containerd.RuntimeRoot, "fifo")),
+		cio.WithFIFODir(fifoRoot),
 		cio.WithStreams(stdinR, stdoutW, stdoutW),
 		cio.WithTerminal,
 	}
@@ -192,7 +200,11 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 }
 
 func (i *Installer) Logs(_ context.Context, id string) (io.ReadCloser, error) {
-	f, err := os.Open(i.logPath(id))
+	logPath, err := i.logPath(id)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(logPath)
 	if os.IsNotExist(err) {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
@@ -209,14 +221,22 @@ func (i *Installer) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClose
 }
 
 func (i *Installer) openLog(id string) (io.WriteCloser, error) {
-	if err := os.MkdirAll(config.Get().Containerd.LogDirectory, 0o700); err != nil {
+	logDirectory, err := containerdLogDirectory()
+	if err != nil {
 		return nil, err
 	}
-	return os.OpenFile(i.logPath(id), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
+		return nil, err
+	}
+	logPath, err := i.logPath(id)
+	if err != nil {
+		return nil, err
+	}
+	return os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 }
 
-func (i *Installer) logPath(id string) string {
-	return filepath.Join(config.Get().Containerd.LogDirectory, id+"-installer.log")
+func (i *Installer) logPath(id string) (string, error) {
+	return containerdInstallerLogPath(id)
 }
 
 func installerMounts(spec environment.InstallationSpec) []specs.Mount {

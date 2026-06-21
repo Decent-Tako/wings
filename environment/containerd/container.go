@@ -23,6 +23,8 @@ import (
 	"github.com/pelican-dev/wings/environment"
 )
 
+const maxContainerdUserID = uint64(^uint32(0))
+
 func (e *Environment) Exists() (bool, error) {
 	_, err := e.container(context.Background())
 	if err != nil {
@@ -56,6 +58,10 @@ func (e *Environment) Create() (err error) {
 	}
 
 	cfg := config.Get()
+	uid, gid, err := e.containerUser()
+	if err != nil {
+		return err
+	}
 	labels := e.containerLabels()
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
@@ -66,7 +72,7 @@ func (e *Environment) Create() (err error) {
 		oci.WithMounts(e.ociMounts()),
 		oci.WithNoNewPrivileges,
 		oci.WithRootFSReadonly(),
-		oci.WithUIDGID(e.containerUser()),
+		oci.WithUIDGID(uid, gid),
 		oci.WithDroppedCapabilities(containerdCapDrop()),
 		oci.WithAnnotations(labels),
 	}
@@ -284,12 +290,39 @@ func (e *Environment) containerLabels() map[string]string {
 	return labels
 }
 
-func (e *Environment) containerUser() (uint32, uint32) {
+func (e *Environment) containerUser() (uint32, uint32, error) {
 	cfg := config.Get()
 	if cfg.System.User.Rootless.Enabled {
-		return uint32(cfg.System.User.Rootless.ContainerUID), uint32(cfg.System.User.Rootless.ContainerGID)
+		uid, err := containerdUserID(cfg.System.User.Rootless.ContainerUID, "system.user.rootless.container_uid")
+		if err != nil {
+			return 0, 0, err
+		}
+		gid, err := containerdUserID(cfg.System.User.Rootless.ContainerGID, "system.user.rootless.container_gid")
+		if err != nil {
+			return 0, 0, err
+		}
+		return uid, gid, nil
 	}
-	return uint32(cfg.System.User.Uid), uint32(cfg.System.User.Gid)
+	uid, err := containerdUserID(cfg.System.User.Uid, "system.user.uid")
+	if err != nil {
+		return 0, 0, err
+	}
+	gid, err := containerdUserID(cfg.System.User.Gid, "system.user.gid")
+	if err != nil {
+		return 0, 0, err
+	}
+	return uid, gid, nil
+}
+
+func containerdUserID(value int, field string) (uint32, error) {
+	if value < 0 {
+		return 0, errors.Errorf("environment/containerd: %s cannot be negative", field)
+	}
+	v := uint64(value)
+	if v > maxContainerdUserID {
+		return 0, errors.Errorf("environment/containerd: %s exceeds uint32 range", field)
+	}
+	return uint32(v), nil
 }
 
 func (e *Environment) snapshotID() string {

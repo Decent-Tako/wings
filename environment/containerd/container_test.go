@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -685,7 +686,11 @@ func TestReadlogTailsRotatedLogs(t *testing.T) {
 		c.Containerd.LogMaxFiles = 3
 	})
 
-	writer, err := newRotatingLogWriter(env.logPath())
+	logPath, err := env.logPath()
+	if err != nil {
+		t.Fatalf("logPath() returned error: %v", err)
+	}
+	writer, err := newRotatingLogWriter(logPath)
 	if err != nil {
 		t.Fatalf("newRotatingLogWriter() returned error: %v", err)
 	}
@@ -697,7 +702,7 @@ func TestReadlogTailsRotatedLogs(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("failed to close log writer: %v", err)
 	}
-	if _, err := os.Stat(rotatedLogPath(env.logPath(), 1)); err != nil {
+	if _, err := os.Stat(rotatedLogPath(logPath, 1)); err != nil {
 		t.Fatalf("expected rotated log file: %v", err)
 	}
 
@@ -708,6 +713,52 @@ func TestReadlogTailsRotatedLogs(t *testing.T) {
 	expected := []string{"l03", "l04", "l05", "l06", "l07"}
 	if strings.Join(lines, ",") != strings.Join(expected, ",") {
 		t.Fatalf("expected %v, got %v", expected, lines)
+	}
+}
+
+func TestReadlogCapsRequestedLines(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	logPath, err := env.logPath()
+	if err != nil {
+		t.Fatalf("logPath() returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("failed to create log directory: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("one\ntwo\n"), 0o600); err != nil {
+		t.Fatalf("failed to write log file: %v", err)
+	}
+
+	lines, err := env.Readlog(maxContainerdReadlogLines + 1)
+	if err != nil {
+		t.Fatalf("Readlog() returned error: %v", err)
+	}
+	if strings.Join(lines, ",") != "one,two" {
+		t.Fatalf("expected capped log read to return available lines, got %v", lines)
+	}
+}
+
+func TestContainerdLogPathRejectsUnsafeIdentifier(t *testing.T) {
+	newContainerdTestConfig(t)
+	if _, err := containerdServerLogPath("../escape"); err == nil {
+		t.Fatal("expected unsafe log identifier to be rejected")
+	}
+}
+
+func TestContainerdDirectoryRejectsRelativePath(t *testing.T) {
+	if _, err := cleanContainerdDirectory("relative/path", "containerd.log_directory"); err == nil {
+		t.Fatal("expected relative containerd directory to be rejected")
+	}
+}
+
+func TestContainerdUserIDRejectsOutOfRangeValues(t *testing.T) {
+	if _, err := containerdUserID(-1, "test.uid"); err == nil {
+		t.Fatal("expected negative uid to be rejected")
+	}
+	if strconv.IntSize > 32 {
+		if _, err := containerdUserID(int(maxContainerdUserID)+1, "test.uid"); err == nil {
+			t.Fatal("expected overflowing uid to be rejected")
+		}
 	}
 }
 

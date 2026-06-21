@@ -25,6 +25,8 @@ import (
 	"github.com/pelican-dev/wings/system"
 )
 
+const maxContainerdReadlogLines = 10_000
+
 func (e *Environment) Attach(ctx context.Context) error {
 	e.mu.RLock()
 	if e.stdin != nil {
@@ -41,7 +43,15 @@ func (e *Environment) Attach(ctx context.Context) error {
 	stdinR, stdinW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
 
-	logWriter, err := newRotatingLogWriter(e.logPath())
+	logPath, err := e.logPath()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return err
+	}
+	logWriter, err := newRotatingLogWriter(logPath)
 	if err != nil {
 		_ = stdinR.Close()
 		_ = stdinW.Close()
@@ -50,8 +60,17 @@ func (e *Environment) Attach(ctx context.Context) error {
 		return errors.Wrap(err, "environment/containerd: failed to open container log")
 	}
 
+	fifoRoot, err := e.fifoRoot()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = logWriter.Close()
+		return err
+	}
 	ioOpts := []cio.Opt{
-		cio.WithFIFODir(e.fifoRoot()),
+		cio.WithFIFODir(fifoRoot),
 		cio.WithStreams(stdinR, stdoutW, stdoutW),
 		cio.WithTerminal,
 	}
@@ -145,9 +164,16 @@ func (e *Environment) Readlog(lines int) ([]string, error) {
 	if lines <= 0 {
 		return []string{}, nil
 	}
+	if lines > maxContainerdReadlogLines {
+		lines = maxContainerdReadlogLines
+	}
 
 	out := make([]string, 0, lines)
-	for _, path := range e.logPathsNewestFirst() {
+	paths, err := e.logPathsNewestFirst()
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range paths {
 		remaining := lines - len(out)
 		if remaining <= 0 {
 			break
@@ -282,21 +308,24 @@ func (e *Environment) watchOOM(ctx context.Context) {
 	}
 }
 
-func (e *Environment) fifoRoot() string {
-	return filepath.Join(config.Get().Containerd.RuntimeRoot, "fifo")
+func (e *Environment) fifoRoot() (string, error) {
+	return containerdFIFORoot()
 }
 
-func (e *Environment) logPath() string {
-	return filepath.Join(config.Get().Containerd.LogDirectory, e.Id+".log")
+func (e *Environment) logPath() (string, error) {
+	return containerdServerLogPath(e.Id)
 }
 
-func (e *Environment) logPathsNewestFirst() []string {
-	path := e.logPath()
+func (e *Environment) logPathsNewestFirst() ([]string, error) {
+	path, err := e.logPath()
+	if err != nil {
+		return nil, err
+	}
 	paths := []string{path}
 	for i := 1; i < containerdLogMaxFiles(); i++ {
 		paths = append(paths, rotatedLogPath(path, i))
 	}
-	return paths
+	return paths, nil
 }
 
 func truncateLog(path string) error {

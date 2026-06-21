@@ -27,7 +27,15 @@ func (Factory) Configure(ctx context.Context) error {
 	if cfg.Network.Mode != "host" {
 		return errors.Wrapf(ErrUnsupportedNetwork, "environment/containerd: containerd currently supports host networking only; set containerd.network.mode to %q until the later CNI/portmap implementation lands", "host")
 	}
-	for _, dir := range []string{cfg.RuntimeRoot, cfg.LogDirectory} {
+	runtimeRoot, err := containerdRuntimeRoot()
+	if err != nil {
+		return err
+	}
+	logDirectory, err := containerdLogDirectory()
+	if err != nil {
+		return err
+	}
+	for _, dir := range []string{runtimeRoot, logDirectory} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return errors.Wrapf(err, "environment/containerd: failed to create %s", dir)
 		}

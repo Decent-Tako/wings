@@ -50,7 +50,11 @@ func (e *Environment) Start(ctx context.Context) error {
 		return e.Attach(ctx)
 	}
 
-	if err := truncateLog(e.logPath()); err != nil {
+	logPath, err := e.logPath()
+	if err != nil {
+		return err
+	}
+	if err := truncateLog(logPath); err != nil {
 		return errors.Wrap(err, "environment/containerd: failed to truncate instance logs")
 	}
 
