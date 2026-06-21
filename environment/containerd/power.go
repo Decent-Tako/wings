@@ -16,7 +16,7 @@ func (e *Environment) OnBeforeStart(ctx context.Context) error {
 	if err := e.removeContainer(ctx); err != nil {
 		return errors.Wrap(err, "environment/containerd: failed to remove container during pre-boot")
 	}
-	if err := e.Create(); err != nil {
+	if err := e.create(ctx); err != nil {
 		if cleanupErr := e.removeContainer(context.Background()); cleanupErr != nil {
 			e.log().WithField("error", cleanupErr).Warn("failed to cleanup partially created containerd container after create error")
 		}
@@ -47,7 +47,12 @@ func (e *Environment) Start(ctx context.Context) error {
 	if running {
 		e.startedAtOrRestore(ctx, time.Now())
 		e.SetState(environment.ProcessRunningState)
-		return e.Attach(ctx)
+		if err := e.Attach(ctx); err != nil {
+			e.SetState(environment.ProcessStoppingState)
+			e.SetState(environment.ProcessOfflineState)
+			return err
+		}
+		return nil
 	}
 
 	logPath, err := e.logPath()
@@ -186,7 +191,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if status.Status != "running" {
+	if status.Status != containerdclient.Running {
 		if e.st.Load() != environment.ProcessOfflineState {
 			e.SetState(environment.ProcessStoppingState)
 			e.SetState(environment.ProcessOfflineState)
@@ -215,7 +220,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 				}
 				return errors.WithStack(err)
 			}
-			if status.Status != "running" {
+			if status.Status != containerdclient.Running {
 				e.SetState(environment.ProcessOfflineState)
 				return nil
 			}
@@ -241,7 +246,7 @@ func (e *Environment) IsRunning(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return status.Status == "running", nil
+	return status.Status == containerdclient.Running, nil
 }
 
 func (e *Environment) ExitState() (uint32, bool, error) {

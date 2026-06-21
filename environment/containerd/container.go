@@ -36,8 +36,12 @@ func (e *Environment) Exists() (bool, error) {
 	return true, nil
 }
 
-func (e *Environment) Create() (err error) {
-	ctx := e.context(context.Background())
+func (e *Environment) Create() error {
+	return e.create(context.Background())
+}
+
+func (e *Environment) create(ctx context.Context) (err error) {
+	ctx = e.context(ctx)
 	e.mu.RLock()
 	imageName := e.meta.Image
 	e.mu.RUnlock()
@@ -116,11 +120,9 @@ func (e *Environment) Destroy() error {
 	if err := e.removeContainer(context.Background()); err != nil {
 		return err
 	}
-	if err := e.removeLogs(); err != nil {
-		return err
-	}
+	err := e.removeLogs()
 	e.SetState(environment.ProcessOfflineState)
-	return nil
+	return err
 }
 
 func (e *Environment) InSituUpdate() error {
@@ -157,7 +159,6 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 
 	if publish != nil {
 		publish(environment.DockerImagePullStarted, "")
-		defer publish(environment.DockerImagePullCompleted, "")
 	}
 
 	opts := []containerdclient.RemoteOpt{
@@ -180,12 +181,16 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 				"image": ref,
 				"err":   err.Error(),
 			}).Warn("unable to pull requested image from remote source, however the image exists locally")
+			if publish != nil {
+				publish(environment.DockerImagePullCompleted, "")
+			}
 			return local, nil
 		}
 		return nil, errors.Wrapf(err, "environment/containerd: failed to pull %q image for server", ref)
 	}
 	if publish != nil {
 		publish(environment.DockerImagePullStatus, "unpacked "+ref)
+		publish(environment.DockerImagePullCompleted, "")
 	}
 	return pulled, nil
 }

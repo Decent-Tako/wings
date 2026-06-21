@@ -59,7 +59,9 @@ func (i *Installer) PullImage(ctx context.Context, image string) error {
 
 	r, err := i.client.ImagePull(pullCtx, image, imagePullOptions)
 	if err != nil {
-		images, ierr := i.client.ImageList(pullCtx, dockerImage.ListOptions{})
+		listCtx, listCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer listCancel()
+		images, ierr := i.client.ImageList(listCtx, dockerImage.ListOptions{})
 		if ierr != nil {
 			return ierr
 		}

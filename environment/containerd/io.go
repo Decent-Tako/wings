@@ -22,6 +22,7 @@ import (
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	"github.com/pelican-dev/wings/remote"
 	"github.com/pelican-dev/wings/system"
 )
 
@@ -121,7 +122,32 @@ func (e *Environment) Attach(ctx context.Context) error {
 
 	pollCtx, pollStop := context.WithCancel(context.Background())
 	oomCtx, oomStop := context.WithCancel(context.Background())
+	cleanupAttach := func() {
+		waitStop()
+		pollStop()
+		oomStop()
+		if createdTask {
+			if _, cleanupErr := task.Delete(e.context(context.Background()), containerdclient.WithProcessKill); cleanupErr != nil {
+				warnContainerdCleanupError(e.log(), cleanupErr, "failed to delete duplicate containerd task after attach race")
+			}
+		}
+		if taskIO := task.IO(); taskIO != nil {
+			taskIO.Cancel()
+			_ = taskIO.Close()
+		}
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = logWriter.Close()
+	}
+
 	e.mu.Lock()
+	if e.stdin != nil {
+		e.mu.Unlock()
+		cleanupAttach()
+		return nil
+	}
 	e.task = task
 	e.taskIO = task.IO()
 	e.stdin = stdinW
@@ -152,7 +178,7 @@ func (e *Environment) SendCommand(command string) error {
 	if stdin == nil {
 		return errors.Wrap(ErrNotAttached, "environment/containerd: cannot send command to container")
 	}
-	if stop.Type == "command" && command == stop.Value {
+	if stop.Type == remote.ProcessStopCommand && command == stop.Value {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
@@ -220,6 +246,9 @@ func (e *Environment) watchExit(waitCtx context.Context, exitC <-chan containerd
 			return
 		}
 		e.log().WithField("error", err).Warn("containerd task exited with error status")
+		if code == 0 {
+			code = 1
+		}
 	}
 
 	e.mu.Lock()

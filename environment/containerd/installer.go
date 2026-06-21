@@ -123,15 +123,6 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	id = spec.ID
 	cleanupSnapshotOnError = false
 
-	defer func() {
-		if err == nil || id != "" {
-			return
-		}
-		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
-			log.WithField("installer_id", spec.ID).WithField("error", cleanupErr).Warn("failed to cleanup containerd installer container after execute error")
-		}
-	}()
-
 	stdinR, stdinW := io.Pipe()
 	defer stdinR.Close()
 	defer stdinW.Close()

@@ -142,6 +142,42 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 	}
 }
 
+func TestEnsureContainerdImageDoesNotPublishCompletedAfterPullFailure(t *testing.T) {
+	newContainerdTestConfig(t)
+	cli := &fakeClient{
+		pullErr: io.ErrUnexpectedEOF,
+		getErr:  errdefs.ErrNotFound,
+	}
+	var topics []string
+
+	_, err := ensureContainerdImage(context.Background(), cli, "example.com/server:latest", func(topic, _ string) {
+		topics = append(topics, topic)
+	})
+	if err == nil {
+		t.Fatal("expected pull failure to return an error")
+	}
+	for _, topic := range topics {
+		if topic == environment.DockerImagePullCompleted {
+			t.Fatalf("expected failed pull not to publish completed event, got topics %v", topics)
+		}
+	}
+}
+
+func TestOnBeforeStartPropagatesCallerCancellationToCreate(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.loadErr = errdefs.ErrNotFound
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := env.OnBeforeStart(ctx)
+	if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("expected caller cancellation from create path, got %v", err)
+	}
+	if cli.pullRef == "" {
+		t.Fatal("expected OnBeforeStart to reach image pull with caller context")
+	}
+}
+
 func TestRegistryResolverOptSkipsUnmatchedPublicImage(t *testing.T) {
 	newContainerdTestConfig(t)
 	config.Update(func(c *config.Configuration) {
@@ -250,6 +286,31 @@ func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
 	}
 }
 
+func TestAttachCleansNewTaskWhenAnotherAttachWinsRace(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		waitHook: func() {
+			attachContainerdTestStdin(t, env)
+		},
+	}
+	cli.container = &fakeContainer{
+		id:      env.Id,
+		taskErr: errdefs.ErrNotFound,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+
+	if err := env.Attach(context.Background()); err != nil {
+		t.Fatalf("Attach() returned error: %v", err)
+	}
+	if task.deleteCalls != 1 {
+		t.Fatalf("expected duplicate new task to be deleted after attach race, got %d deletes", task.deleteCalls)
+	}
+	if !env.IsAttached() {
+		t.Fatal("expected original attach state to remain attached")
+	}
+}
+
 func TestStartKeepsTaskWaitAliveAfterAttachContextCanceled(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	task := &fakeTask{waitOnContextCancel: true}
@@ -303,6 +364,25 @@ func TestWatchExitIgnoresCanceledWaitContext(t *testing.T) {
 	}
 }
 
+func TestWatchExitRecordsNonZeroCodeForErrorStatus(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running}
+	attachContainerdTestStdin(t, env)
+	exitC := make(chan containerdclient.ExitStatus, 1)
+	exitC <- *containerdclient.NewExitStatus(0, time.Now(), io.ErrClosedPipe)
+	close(exitC)
+
+	env.watchExit(context.Background(), exitC, task)
+
+	code, _, err := env.ExitState()
+	if err != nil {
+		t.Fatalf("ExitState() returned error: %v", err)
+	}
+	if code == 0 {
+		t.Fatal("expected error exit status to be recorded as non-zero")
+	}
+}
+
 func TestStartReattachesRunningTaskAndRestoresStartedAt(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	startedAt := time.Now().Add(-2 * time.Minute).UTC()
@@ -333,6 +413,27 @@ func TestStartReattachesRunningTaskAndRestoresStartedAt(t *testing.T) {
 	}
 	if uptime <= 0 {
 		t.Fatalf("expected restored uptime to be positive, got %d", uptime)
+	}
+}
+
+func TestStartMarksOfflineWhenRunningTaskReattachFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		status:  containerdclient.Running,
+		waitErr: io.ErrClosedPipe,
+	}
+	cli.container = &fakeContainer{
+		id:     env.Id,
+		task:   task,
+		labels: map[string]string{},
+	}
+
+	err := env.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed to wait on task") {
+		t.Fatalf("expected reattach wait error, got %v", err)
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected failed reattach to leave environment offline, got %q", env.State())
 	}
 }
 
@@ -762,6 +863,35 @@ func TestDestroyRemovesServerLogs(t *testing.T) {
 	}
 }
 
+func TestDestroyMarksOfflineWhenLogRemovalFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	container := &fakeContainer{id: env.Id, labels: map[string]string{}}
+	cli.container = container
+	env.SetState(environment.ProcessRunningState)
+
+	logPath, err := env.logPath()
+	if err != nil {
+		t.Fatalf("logPath() returned error: %v", err)
+	}
+	if err := os.MkdirAll(logPath, 0o700); err != nil {
+		t.Fatalf("failed to create log path directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(logPath, "child"), []byte("not removable as file"), 0o600); err != nil {
+		t.Fatalf("failed to write child file: %v", err)
+	}
+
+	err = env.Destroy()
+	if err == nil {
+		t.Fatal("expected log removal error")
+	}
+	if !container.deleted {
+		t.Fatal("expected Destroy to delete the container")
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected Destroy to mark offline after container removal, got %q", env.State())
+	}
+}
+
 func TestReadlogTailsRotatedLogs(t *testing.T) {
 	env, _ := newContainerdTestEnvironment(t)
 	config.Update(func(c *config.Configuration) {
@@ -1034,6 +1164,9 @@ func (f *fakeClient) GetImage(ctx context.Context, ref string) (containerdclient
 func (f *fakeClient) Pull(ctx context.Context, ref string, _ ...containerdclient.RemoteOpt) (containerdclient.Image, error) {
 	f.pullRef = ref
 	f.pullNamespace = testContainerdNamespace(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.pullErr != nil {
 		return nil, f.pullErr
 	}
@@ -1161,6 +1294,7 @@ type fakeTask struct {
 	waitErr             error
 	waitOnContextCancel bool
 	exitOnStart         bool
+	waitHook            func()
 
 	metric    *apitypes.Metric
 	metricErr error
@@ -1232,6 +1366,9 @@ func (f *fakeTask) Wait(ctx context.Context) (<-chan containerdclient.ExitStatus
 			ch <- *containerdclient.NewExitStatus(0, time.Now(), ctx.Err())
 			close(ch)
 		}(f.waitCh)
+	}
+	if f.waitHook != nil {
+		f.waitHook()
 	}
 	return f.waitCh, nil
 }
