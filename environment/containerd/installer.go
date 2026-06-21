@@ -43,29 +43,31 @@ func (i *Installer) Remove(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	defer os.Remove(logPath)
 
-	c, err := i.client.LoadContainer(WithNamespace(ctx), id)
+	ctx, cancel := containerdCleanupContext(ctx)
+	defer cancel()
+
+	c, err := i.client.LoadContainer(ctx, id)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			_ = os.Remove(logPath)
 			return nil
 		}
 		return err
 	}
 
 	var firstErr error
-	if task, err := c.Task(WithNamespace(ctx), nil); err == nil {
-		if _, err := task.Delete(WithNamespace(ctx), containerdclient.WithProcessKill); err != nil {
+	if task, err := c.Task(ctx, nil); err == nil {
+		if _, err := task.Delete(ctx, containerdclient.WithProcessKill); err != nil {
 			firstErr = warnContainerdCleanupError(log.WithField("installer_id", id), err, "failed to delete containerd installer task during removal")
 		}
 	} else if !errdefs.IsNotFound(err) {
 		return err
 	}
 
-	if err := c.Delete(WithNamespace(ctx), containerdclient.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
+	if err := c.Delete(ctx, containerdclient.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
-	_ = os.Remove(logPath)
 	return firstErr
 }
 
@@ -284,6 +286,7 @@ func installerMounts(spec environment.InstallationSpec) []specs.Mount {
 				"rw",
 				"exec",
 				"nosuid",
+				"mode=1777",
 				"size=" + tmpfsSize + "m",
 			},
 		},

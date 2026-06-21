@@ -23,7 +23,10 @@ import (
 	"github.com/pelican-dev/wings/environment"
 )
 
-const maxContainerdUserID = uint64(^uint32(0))
+const (
+	maxContainerdUserID      = uint64(^uint32(0))
+	containerdCleanupTimeout = 30 * time.Second
+)
 
 func (e *Environment) Exists() (bool, error) {
 	_, err := e.container(context.Background())
@@ -206,14 +209,17 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 }
 
 func ensureImageUnpacked(ctx context.Context, image containerdclient.Image, snapshotter string) (containerdclient.Image, error) {
-	unpacked, err := image.IsUnpacked(ctx, snapshotter)
+	unpackCtx, cancel := imagePullContext(ctx)
+	defer cancel()
+
+	unpacked, err := image.IsUnpacked(unpackCtx, snapshotter)
 	if err != nil {
 		return nil, errors.Wrap(err, "environment/containerd: failed to inspect local image unpack status")
 	}
 	if unpacked {
 		return image, nil
 	}
-	if err := image.Unpack(ctx, snapshotter); err != nil {
+	if err := image.Unpack(unpackCtx, snapshotter); err != nil {
 		return nil, errors.Wrap(err, "environment/containerd: failed to unpack local image")
 	}
 	return image, nil
@@ -310,6 +316,7 @@ func (e *Environment) ociMounts() []specs.Mount {
 			"rw",
 			"exec",
 			"nosuid",
+			"mode=1777",
 			"size=" + strconv.Itoa(int(config.Get().Docker.TmpfsSize)) + "m",
 		},
 	})
@@ -367,7 +374,9 @@ func (e *Environment) snapshotID() string {
 }
 
 func (e *Environment) removeContainer(ctx context.Context) error {
-	ctx = e.context(ctx)
+	ctx, cancel := containerdCleanupContext(ctx)
+	defer cancel()
+
 	c, err := e.client.LoadContainer(ctx, e.Id)
 	if err != nil {
 		if errdefs.IsNotFound(err) {

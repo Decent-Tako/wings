@@ -20,6 +20,10 @@ func warnContainerdCleanupError(entry *log.Entry, err error, message string) err
 	return err
 }
 
+func containerdCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(WithNamespace(ctx), containerdCleanupTimeout)
+}
+
 func cleanupContainerdSnapshot(ctx context.Context, cli clientAPI, snapshotter, snapshotID string, entry *log.Entry) error {
 	provider, ok := cli.(snapshotServiceProvider)
 	if !ok {

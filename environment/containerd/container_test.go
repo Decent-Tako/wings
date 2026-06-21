@@ -165,6 +165,43 @@ func TestEnsureContainerdImageUnpacksLocalImage(t *testing.T) {
 	}
 }
 
+func TestEnsureImageUnpackedUsesBoundedContext(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.ImagePullTimeout = 1
+	})
+	unpacked := false
+	var isUnpackedCtx context.Context
+	var unpackCtx context.Context
+	before := time.Now()
+	img := fakeImage{
+		name:          "local/server:latest",
+		unpacked:      &unpacked,
+		isUnpackedCtx: &isUnpackedCtx,
+		unpackCtx:     &unpackCtx,
+	}
+
+	if _, err := ensureImageUnpacked(context.Background(), img, "overlayfs"); err != nil {
+		t.Fatalf("ensureImageUnpacked() returned error: %v", err)
+	}
+
+	for name, ctx := range map[string]context.Context{
+		"IsUnpacked": isUnpackedCtx,
+		"Unpack":     unpackCtx,
+	} {
+		if ctx == nil {
+			t.Fatalf("expected %s to receive a context", name)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("expected %s context to have a deadline", name)
+		}
+		if deadline.Before(before) || deadline.After(before.Add(2*time.Second)) {
+			t.Fatalf("expected %s deadline to use configured image timeout, got %s from start %s", name, deadline, before)
+		}
+	}
+}
+
 func TestEnsureContainerdImageUnpacksFallbackImageAfterPullFailure(t *testing.T) {
 	newContainerdTestConfig(t)
 	unpacked := false
@@ -321,6 +358,65 @@ func TestHostNetworkSpecOptsMountNameResolutionFiles(t *testing.T) {
 			t.Fatalf("expected host network spec opts to bind mount %s read-only, got %#v", expected, spec.Mounts)
 		}
 	}
+}
+
+func TestContainerdTmpfsMountsUseStickyWorldWritableMode(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	serverTmp := findMount(t, env.ociMounts(), "/tmp")
+	if !mountHasOption(serverTmp, "mode=1777") {
+		t.Fatalf("expected server /tmp tmpfs to set sticky mode, got %#v", serverTmp.Options)
+	}
+
+	spec := newContainerdTestInstallationSpec(t)
+	installerTmp := findMount(t, installerMounts(spec), "/tmp")
+	if !mountHasOption(installerTmp, "mode=1777") {
+		t.Fatalf("expected installer /tmp tmpfs to set sticky mode, got %#v", installerTmp.Options)
+	}
+}
+
+func TestContainerdCapDropMatchesDockerBackendPolicy(t *testing.T) {
+	expected := []string{
+		"CAP_SETPCAP",
+		"CAP_MKNOD",
+		"CAP_AUDIT_WRITE",
+		"CAP_NET_RAW",
+		"CAP_DAC_OVERRIDE",
+		"CAP_FOWNER",
+		"CAP_FSETID",
+		"CAP_NET_BIND_SERVICE",
+		"CAP_SYS_CHROOT",
+		"CAP_SETFCAP",
+		"CAP_SYS_PTRACE",
+	}
+	got := containerdCapDrop()
+	if len(got) != len(expected) {
+		t.Fatalf("expected %d dropped capabilities, got %d: %v", len(expected), len(got), got)
+	}
+	for i := range expected {
+		if got[i] != expected[i] {
+			t.Fatalf("expected dropped capability %d to be %q, got %q", i, expected[i], got[i])
+		}
+	}
+}
+
+func findMount(t *testing.T, mounts []specs.Mount, destination string) specs.Mount {
+	t.Helper()
+	for _, mount := range mounts {
+		if mount.Destination == destination {
+			return mount
+		}
+	}
+	t.Fatalf("expected mount for %s in %#v", destination, mounts)
+	return specs.Mount{}
+}
+
+func mountHasOption(mount specs.Mount, option string) bool {
+	for _, got := range mount.Options {
+		if got == option {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
@@ -481,11 +577,30 @@ func TestWatchExitRetriesWaitErrorWhenTaskIsStillRunning(t *testing.T) {
 		t.Fatalf("expected wait error for running task to preserve running state, got %q", env.State())
 	}
 
+	task.status = containerdclient.Stopped
 	close(task.waitCh)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for watchExit to stop after closing retried wait channel")
+	}
+}
+
+func TestWatchExitClosesAttachWhenWaitChannelClosesAfterTaskStops(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Stopped}
+	attachContainerdTestStdin(t, env)
+	env.SetState(environment.ProcessRunningState)
+	exitC := make(chan containerdclient.ExitStatus)
+	close(exitC)
+
+	env.watchExit(context.Background(), exitC, task)
+
+	if env.IsAttached() {
+		t.Fatal("expected closed wait channel to close attach state after task stopped")
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected closed wait channel to mark server offline after task stopped, got %q", env.State())
 	}
 }
 
@@ -639,6 +754,38 @@ func TestRemoveContainerPreservesTaskDeleteError(t *testing.T) {
 	err := env.removeContainer(context.Background())
 	if err != io.ErrClosedPipe {
 		t.Fatalf("expected task delete error to be preserved, got %v", err)
+	}
+}
+
+func TestRemoveContainerUsesBoundedCleanupContext(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{}
+	container := &fakeContainer{
+		id:     env.Id,
+		task:   task,
+		labels: map[string]string{},
+	}
+	cli.container = container
+	before := time.Now()
+
+	if err := env.removeContainer(context.Background()); err != nil {
+		t.Fatalf("removeContainer() returned error: %v", err)
+	}
+
+	for name, ctx := range map[string]context.Context{
+		"task delete":      task.deleteCtx,
+		"container delete": container.deleteCtx,
+	} {
+		if ctx == nil {
+			t.Fatalf("expected %s to receive a context", name)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("expected %s context to have a cleanup deadline", name)
+		}
+		if deadline.Before(before) || deadline.After(before.Add(containerdCleanupTimeout+time.Second)) {
+			t.Fatalf("expected %s deadline to use cleanup timeout, got %s from start %s", name, deadline, before)
+		}
 	}
 }
 
@@ -921,6 +1068,53 @@ func TestInstallerExecuteErrorsWhenWaitChannelCloses(t *testing.T) {
 	}
 	if id != spec.ID {
 		t.Fatalf("expected failed installer id %q, got %q", spec.ID, id)
+	}
+}
+
+func TestInstallerRemoveDeletesLogWhenContainerDeleteFails(t *testing.T) {
+	newContainerdTestConfig(t)
+	id := "test-installer"
+	logPath, err := containerdInstallerLogPath(id)
+	if err != nil {
+		t.Fatalf("containerdInstallerLogPath() returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("failed to create installer log directory: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("installer log"), 0o600); err != nil {
+		t.Fatalf("failed to create installer log: %v", err)
+	}
+	task := &fakeTask{}
+	container := &fakeContainer{
+		id:        id,
+		task:      task,
+		deleteErr: io.ErrClosedPipe,
+		labels:    map[string]string{},
+	}
+	installer := &Installer{client: &fakeClient{container: container}}
+	before := time.Now()
+
+	err = installer.Remove(context.Background(), id)
+	if err != io.ErrClosedPipe {
+		t.Fatalf("expected container delete error to be returned, got %v", err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("expected installer log to be removed even after delete failure, stat err=%v", err)
+	}
+	for name, ctx := range map[string]context.Context{
+		"task delete":      task.deleteCtx,
+		"container delete": container.deleteCtx,
+	} {
+		if ctx == nil {
+			t.Fatalf("expected installer %s to receive a context", name)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatalf("expected installer %s context to have a cleanup deadline", name)
+		}
+		if deadline.Before(before) || deadline.After(before.Add(containerdCleanupTimeout+time.Second)) {
+			t.Fatalf("expected installer %s deadline to use cleanup timeout, got %s from start %s", name, deadline, before)
+		}
 	}
 }
 
@@ -1453,6 +1647,7 @@ type fakeContainer struct {
 	labels          map[string]string
 	deleteErr       error
 	deleted         bool
+	deleteCtx       context.Context
 	deleteNamespace string
 }
 
@@ -1464,6 +1659,7 @@ func (f *fakeContainer) Info(context.Context, ...containerdclient.InfoOpts) (con
 
 func (f *fakeContainer) Delete(ctx context.Context, _ ...containerdclient.DeleteOpts) error {
 	f.deleted = true
+	f.deleteCtx = ctx
 	f.deleteNamespace = testContainerdNamespace(ctx)
 	return f.deleteErr
 }
@@ -1549,6 +1745,7 @@ type fakeTask struct {
 	startNamespace       string
 	startErr             error
 	deleteCalls          int
+	deleteCtx            context.Context
 	deleteNamespace      string
 	deleteErr            error
 	killed               []syscall.Signal
@@ -1582,6 +1779,7 @@ func (f *fakeTask) Start(ctx context.Context) error {
 
 func (f *fakeTask) Delete(ctx context.Context, _ ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
 	f.deleteCalls++
+	f.deleteCtx = ctx
 	f.deleteNamespace = testContainerdNamespace(ctx)
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
@@ -1666,10 +1864,12 @@ func (f *fakeTask) Metrics(context.Context) (*apitypes.Metric, error) {
 func (f *fakeTask) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
 
 type fakeImage struct {
-	name        string
-	unpacked    *bool
-	unpackCalls *int
-	unpackErr   error
+	name          string
+	unpacked      *bool
+	unpackCalls   *int
+	unpackErr     error
+	unpackCtx     *context.Context
+	isUnpackedCtx *context.Context
 }
 
 func (f fakeImage) Name() string { return f.name }
@@ -1680,7 +1880,10 @@ func (f fakeImage) Target() ocispec.Descriptor {
 
 func (f fakeImage) Labels() map[string]string { return nil }
 
-func (f fakeImage) Unpack(context.Context, string, ...containerdclient.UnpackOpt) error {
+func (f fakeImage) Unpack(ctx context.Context, _ string, _ ...containerdclient.UnpackOpt) error {
+	if f.unpackCtx != nil {
+		*f.unpackCtx = ctx
+	}
 	if f.unpackCalls != nil {
 		*f.unpackCalls = *f.unpackCalls + 1
 	}
@@ -1705,7 +1908,10 @@ func (f fakeImage) Config(context.Context) (ocispec.Descriptor, error) {
 	return ocispec.Descriptor{}, nil
 }
 
-func (f fakeImage) IsUnpacked(context.Context, string) (bool, error) {
+func (f fakeImage) IsUnpacked(ctx context.Context, _ string) (bool, error) {
+	if f.isUnpackedCtx != nil {
+		*f.isUnpackedCtx = ctx
+	}
 	if f.unpacked == nil {
 		return true, nil
 	}

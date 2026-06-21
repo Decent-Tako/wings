@@ -241,6 +241,27 @@ func (e *Environment) watchExit(waitCtx context.Context, exitC <-chan containerd
 	for {
 		status, ok := <-exitC
 		if !ok {
+			if waitCtx.Err() != nil {
+				return
+			}
+			running, inspectErr := taskIsRunning(e.context(context.Background()), task)
+			if inspectErr != nil {
+				e.log().WithField("inspect_error", inspectErr).Warn("containerd task wait channel closed unexpectedly; preserving attach state because task status is unknown")
+				return
+			}
+			if running {
+				e.log().Warn("containerd task wait channel closed while task is still running; retrying wait")
+				nextExitC, waitErr := task.Wait(e.context(waitCtx))
+				if waitErr != nil {
+					e.log().WithField("error", waitErr).Warn("failed to re-register containerd task wait after closed wait channel")
+					return
+				}
+				exitC = nextExitC
+				continue
+			}
+			e.log().Warn("containerd task wait channel closed unexpectedly after task stopped")
+			e.closeAttach()
+			e.SetState(environment.ProcessOfflineState)
 			return
 		}
 

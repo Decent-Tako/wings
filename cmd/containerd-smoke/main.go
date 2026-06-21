@@ -31,7 +31,7 @@ func run() error {
 	namespace := flag.String("namespace", env("CONTAINERD_NAMESPACE", "pelican-smoke"), "containerd namespace")
 	image := flag.String("image", env("SMOKE_IMAGE", "docker.io/library/busybox:1.36"), "image to run through the containerd backend")
 	containerID := flag.String("container-id", env("SMOKE_CONTAINER_ID", "pelican-smoke-"+time.Now().UTC().Format("20060102T150405Z")), "containerd container ID")
-	root := flag.String("root", env("SMOKE_ROOT", "/tmp/pelican-containerd-smoke"), "scratch root for runtime, logs, and server files")
+	root := flag.String("root", env("SMOKE_ROOT", defaultSmokeRoot()), "scratch root for runtime, logs, and server files")
 	stayRunningFor := flag.Duration("stay-running-for", durationEnv("SMOKE_STAY_RUNNING_FOR", 5*time.Second), "duration to assert the task remains running")
 	flag.Parse()
 
@@ -164,11 +164,12 @@ func run() error {
 	}
 	fmt.Printf("SMOKE step=lifecycle action=stop result=ok wings_state=%s\n", proc.State())
 
+	cleaned = true
 	if err := proc.Destroy(); err != nil {
+		cleanupRoot(*root)
 		return fmt.Errorf("step=cleanup/destroy: %w", err)
 	}
 	cleanupRoot(*root)
-	cleaned = true
 	fmt.Println("SMOKE step=cleanup result=ok")
 	fmt.Println("SMOKE result=pass")
 	return nil
@@ -278,6 +279,10 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+func defaultSmokeRoot() string {
+	return filepath.Join(os.TempDir(), "pelican-containerd-smoke")
+}
+
 func durationEnv(key string, fallback time.Duration) time.Duration {
 	value := os.Getenv(key)
 	if value == "" {
@@ -292,8 +297,7 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 
 func cleanupRoot(root string) {
 	root = filepath.Clean(root)
-	tmp := filepath.Clean(os.TempDir())
-	if root == "" || root == "." || root == "/" || root == tmp || !strings.HasPrefix(root, tmp+string(os.PathSeparator)) {
+	if !isTempSubdirectory(root) {
 		fmt.Printf("SMOKE step=cleanup-root result=skip root=%q\n", root)
 		return
 	}
@@ -302,4 +306,23 @@ func cleanupRoot(root string) {
 		return
 	}
 	fmt.Printf("SMOKE step=cleanup-root result=ok root=%q\n", root)
+}
+
+func isTempSubdirectory(root string) bool {
+	if root == "" || root == "." || root == string(os.PathSeparator) {
+		return false
+	}
+	tmp, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return false
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(tmp, root)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != "" && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }

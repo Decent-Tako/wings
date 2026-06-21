@@ -22,3 +22,24 @@ func TestCleanupRootRemovesCustomTempSubdirectory(t *testing.T) {
 		t.Fatalf("expected cleanupRoot to remove custom temp root, stat err=%v", err)
 	}
 }
+
+func TestDefaultSmokeRootUsesGoTempDirectory(t *testing.T) {
+	root := defaultSmokeRoot()
+	if !isTempSubdirectory(root) {
+		t.Fatalf("expected default smoke root %q to be a temp subdirectory of %q", root, os.TempDir())
+	}
+	if filepath.Base(root) != "pelican-containerd-smoke" {
+		t.Fatalf("expected stable default smoke root basename, got %q", filepath.Base(root))
+	}
+}
+
+func TestCleanupRootSkipsUnsafeRoots(t *testing.T) {
+	for _, root := range []string{"", ".", string(os.PathSeparator), os.TempDir(), filepath.Join(os.TempDir(), "..")} {
+		t.Run(root, func(t *testing.T) {
+			cleanupRoot(root)
+			if _, err := os.Stat(os.TempDir()); err != nil {
+				t.Fatalf("expected temp directory to remain after skipped cleanup, got %v", err)
+			}
+		})
+	}
+}
