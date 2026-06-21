@@ -56,9 +56,19 @@ func containerdLogPath(id, suffix string) (string, error) {
 }
 
 func ensureContainerdDirectory(dir string) error {
-	// codeql[go/path-injection] dir is daemon-local admin configuration already
-	// normalized and bounded by cleanContainerdDirectory before reaching this sink.
-	return os.MkdirAll(dir, 0o700)
+	rel, err := filepath.Rel(string(filepath.Separator), dir)
+	if err != nil {
+		return err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.Errorf("environment/containerd: directory %q escapes filesystem root", dir)
+	}
+	root, err := os.OpenRoot(string(filepath.Separator))
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return root.MkdirAll(rel, 0o700)
 }
 
 func cleanContainerdDirectory(value, field string) (string, error) {
