@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/pelican-dev/wings/environment"
 )
 
 func TestCleanupRootRemovesCustomTempSubdirectory(t *testing.T) {
@@ -42,4 +46,34 @@ func TestCleanupRootSkipsUnsafeRoots(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAssertStaysRunningChecksProcessAtDeadline(t *testing.T) {
+	proc := &fakeStatusProcess{running: false, state: environment.ProcessOfflineState}
+
+	err := assertStaysRunning(context.Background(), proc, time.Nanosecond)
+	if err == nil {
+		t.Fatal("expected stopped process to fail stays-running assertion")
+	}
+}
+
+func TestAssertStaysRunningPassesForRunningProcess(t *testing.T) {
+	proc := &fakeStatusProcess{running: true, state: environment.ProcessRunningState}
+
+	if err := assertStaysRunning(context.Background(), proc, time.Millisecond); err != nil {
+		t.Fatalf("expected running process to pass stays-running assertion, got %v", err)
+	}
+}
+
+type fakeStatusProcess struct {
+	running bool
+	state   string
+}
+
+func (f *fakeStatusProcess) IsRunning(context.Context) (bool, error) {
+	return f.running, nil
+}
+
+func (f *fakeStatusProcess) State() string {
+	return f.state
 }

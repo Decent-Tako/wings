@@ -164,12 +164,12 @@ func run() error {
 	}
 	fmt.Printf("SMOKE step=lifecycle action=stop result=ok wings_state=%s\n", proc.State())
 
-	cleaned = true
 	if err := proc.Destroy(); err != nil {
 		cleanupRoot(*root)
 		return fmt.Errorf("step=cleanup/destroy: %w", err)
 	}
 	cleanupRoot(*root)
+	cleaned = true
 	fmt.Println("SMOKE step=cleanup result=ok")
 	fmt.Println("SMOKE result=pass")
 	return nil
@@ -221,28 +221,40 @@ func waitRunning(ctx context.Context, proc environment.ProcessEnvironment, timeo
 	}
 }
 
-func assertStaysRunning(ctx context.Context, proc environment.ProcessEnvironment, duration time.Duration) error {
+type processStatus interface {
+	IsRunning(context.Context) (bool, error)
+	State() string
+}
+
+func assertStaysRunning(ctx context.Context, proc processStatus, duration time.Duration) error {
+	check := func() error {
+		running, err := proc.IsRunning(ctx)
+		if err != nil {
+			return err
+		}
+		if !running {
+			return fmt.Errorf("task stopped before %s elapsed; wings_state=%s", duration, proc.State())
+		}
+		if proc.State() == environment.ProcessOfflineState {
+			return fmt.Errorf("wings state became offline while task was still running")
+		}
+		return nil
+	}
+
 	deadline := time.NewTimer(duration)
 	defer deadline.Stop()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if err := check(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return nil
+			return check()
 		case <-ticker.C:
-			running, err := proc.IsRunning(ctx)
-			if err != nil {
-				return err
-			}
-			if !running {
-				return fmt.Errorf("task stopped before %s elapsed; wings_state=%s", duration, proc.State())
-			}
-			if proc.State() == environment.ProcessOfflineState {
-				return fmt.Errorf("wings state became offline while task was still running")
-			}
 		}
 	}
 }

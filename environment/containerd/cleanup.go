@@ -30,9 +30,12 @@ func cleanupContainerdSnapshot(ctx context.Context, cli clientAPI, snapshotter, 
 		entry.WithField("snapshot_id", snapshotID).Warn("containerd client does not expose snapshot cleanup")
 		return nil
 	}
+	cleanupCtx, cancel := containerdCleanupContext(ctx)
+	defer cancel()
+
 	return warnContainerdCleanupError(
 		entry.WithField("snapshot_id", snapshotID),
-		provider.SnapshotService(snapshotter).Remove(WithNamespace(ctx), snapshotID),
+		provider.SnapshotService(snapshotter).Remove(cleanupCtx, snapshotID),
 		"failed to cleanup containerd snapshot",
 	)
 }

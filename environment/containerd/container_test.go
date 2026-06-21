@@ -65,6 +65,7 @@ func TestCreateUsesLocalImageWhenImageIsPrefixedWithTilde(t *testing.T) {
 	env.SetProcessMetadata(environment.ProcessMetadata{Image: "~local/server:latest"})
 	cli.loadErr = errdefs.ErrNotFound
 	cli.getImage = fakeImage{name: "local/server:latest"}
+	before := time.Now()
 
 	if err := env.Create(); err != nil {
 		t.Fatalf("Create() returned error: %v", err)
@@ -76,6 +77,7 @@ func TestCreateUsesLocalImageWhenImageIsPrefixedWithTilde(t *testing.T) {
 	if cli.getRef != "local/server:latest" {
 		t.Fatalf("expected GetImage without tilde, got %q", cli.getRef)
 	}
+	assertContextDeadlineWithin(t, "local GetImage", cli.getCtx, before, 15*time.Minute+time.Second)
 }
 
 func TestCreateRejectsUnsupportedContainerdNetworking(t *testing.T) {
@@ -294,6 +296,7 @@ func TestCreateCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	cli.pullImage = fakeImage{name: "example.com/server:latest"}
 	cli.newContainerErr = io.ErrUnexpectedEOF
 	cli.snapshotter = &fakeSnapshotter{}
+	before := time.Now()
 
 	err := env.Create()
 	if err == nil || !strings.Contains(err.Error(), "failed to create container") {
@@ -302,6 +305,10 @@ func TestCreateCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	if len(cli.snapshotter.removed) != 1 || cli.snapshotter.removed[0] != env.snapshotID() {
 		t.Fatalf("expected snapshot %q to be removed, got %v", env.snapshotID(), cli.snapshotter.removed)
 	}
+	if len(cli.snapshotter.removeContexts) != 1 {
+		t.Fatalf("expected one snapshot cleanup context, got %d", len(cli.snapshotter.removeContexts))
+	}
+	assertContextDeadlineWithin(t, "snapshot cleanup", cli.snapshotter.removeContexts[0], before, containerdCleanupTimeout+time.Second)
 }
 
 func TestCreatePreservesOriginalErrorWhenSnapshotCleanupFails(t *testing.T) {
@@ -417,6 +424,20 @@ func mountHasOption(mount specs.Mount, option string) bool {
 		}
 	}
 	return false
+}
+
+func assertContextDeadlineWithin(t *testing.T, name string, ctx context.Context, before time.Time, timeout time.Duration) {
+	t.Helper()
+	if ctx == nil {
+		t.Fatalf("expected %s to receive a context", name)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatalf("expected %s context to have a deadline", name)
+	}
+	if deadline.Before(before) || deadline.After(before.Add(timeout)) {
+		t.Fatalf("expected %s deadline within %s, got %s from start %s", name, timeout, deadline, before)
+	}
 }
 
 func TestAttachDeletesNewTaskWhenWaitFails(t *testing.T) {
@@ -789,6 +810,22 @@ func TestRemoveContainerUsesBoundedCleanupContext(t *testing.T) {
 	}
 }
 
+func TestInSituUpdateUsesBoundedContext(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	before := time.Now()
+
+	if err := env.InSituUpdate(); err != nil {
+		t.Fatalf("InSituUpdate() returned error: %v", err)
+	}
+
+	assertContextDeadlineWithin(t, "task update", task.updateCtx, before, 11*time.Second)
+	if namespace := testContainerdNamespace(task.updateCtx); namespace != "pelican" {
+		t.Fatalf("expected task update to use namespace pelican, got %q", namespace)
+	}
+}
+
 func TestDestroyMarksOfflineWhenContainerRemovalFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	cli.container = &fakeContainer{
@@ -916,6 +953,7 @@ func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
 		snapshotter:     &fakeSnapshotter{},
 	}
 	installer := &Installer{client: cli}
+	before := time.Now()
 
 	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
 	if err == nil || !strings.Contains(err.Error(), "failed to create installer container") {
@@ -927,6 +965,10 @@ func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	if len(cli.snapshotter.removeNamespaces) != 1 || cli.snapshotter.removeNamespaces[0] != "test-pelican" {
 		t.Fatalf("expected installer snapshot cleanup to use namespace test-pelican, got %v", cli.snapshotter.removeNamespaces)
 	}
+	if len(cli.snapshotter.removeContexts) != 1 {
+		t.Fatalf("expected installer snapshot cleanup context, got %d", len(cli.snapshotter.removeContexts))
+	}
+	assertContextDeadlineWithin(t, "installer snapshot cleanup", cli.snapshotter.removeContexts[0], before, containerdCleanupTimeout+time.Second)
 }
 
 func TestInstallerPullImageUsesConfiguredNamespace(t *testing.T) {
@@ -1554,6 +1596,7 @@ type fakeClient struct {
 	getRef       string
 	getImage     containerdclient.Image
 	getErr       error
+	getCtx       context.Context
 	getNamespace string
 
 	pullRef       string
@@ -1591,6 +1634,7 @@ func (f *fakeClient) NewContainer(ctx context.Context, id string, opts ...contai
 
 func (f *fakeClient) GetImage(ctx context.Context, ref string) (containerdclient.Image, error) {
 	f.getRef = ref
+	f.getCtx = ctx
 	f.getNamespace = testContainerdNamespace(ctx)
 	if f.getErr != nil {
 		return nil, f.getErr
@@ -1752,6 +1796,7 @@ type fakeTask struct {
 	killErr              error
 	stayRunningAfterKill bool
 	statusErr            error
+	updateCtx            context.Context
 }
 
 func (f *fakeTask) ID() string { return "test-server" }
@@ -1848,7 +1893,10 @@ func (f *fakeTask) Checkpoint(context.Context, ...containerdclient.CheckpointTas
 	return fakeImage{name: "checkpoint"}, nil
 }
 
-func (f *fakeTask) Update(context.Context, ...containerdclient.UpdateTaskOpts) error { return nil }
+func (f *fakeTask) Update(ctx context.Context, _ ...containerdclient.UpdateTaskOpts) error {
+	f.updateCtx = ctx
+	return nil
+}
 
 func (f *fakeTask) LoadProcess(context.Context, string, cio.Attach) (containerdclient.Process, error) {
 	return nil, errdefs.ErrNotImplemented
@@ -1930,6 +1978,7 @@ func (f fakeImage) Spec(context.Context) (ocispec.Image, error) { return ocispec
 
 type fakeSnapshotter struct {
 	removed          []string
+	removeContexts   []context.Context
 	removeNamespaces []string
 	removeErr        error
 }
@@ -1964,6 +2013,7 @@ func (f *fakeSnapshotter) Commit(context.Context, string, string, ...snapshots.O
 
 func (f *fakeSnapshotter) Remove(ctx context.Context, key string) error {
 	f.removed = append(f.removed, key)
+	f.removeContexts = append(f.removeContexts, ctx)
 	f.removeNamespaces = append(f.removeNamespaces, testContainerdNamespace(ctx))
 	return f.removeErr
 }

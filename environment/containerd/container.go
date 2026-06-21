@@ -130,7 +130,10 @@ func (e *Environment) Destroy() error {
 }
 
 func (e *Environment) InSituUpdate() error {
-	task, err := e.currentTask(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	task, err := e.currentTask(ctx)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			return nil
@@ -139,7 +142,7 @@ func (e *Environment) InSituUpdate() error {
 	}
 
 	resources := linuxResources(e.Configuration.Limits())
-	if err := task.Update(e.context(context.Background()), containerdclient.WithResources(resources)); err != nil {
+	if err := task.Update(e.context(ctx), containerdclient.WithResources(resources)); err != nil {
 		return errors.Wrap(err, "environment/containerd: could not update task resources")
 	}
 	return nil
@@ -154,17 +157,21 @@ func (e *Environment) ensureImageExists(ctx context.Context, image string) (cont
 func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, publish func(string, string)) (containerdclient.Image, error) {
 	ctx = WithNamespace(ctx)
 	ref := strings.TrimPrefix(image, "~")
-	pullCtx, cancel := imagePullContext(ctx)
-	defer cancel()
 	snapshotter := config.Get().Containerd.Snapshotter
 
 	if strings.HasPrefix(image, "~") {
-		local, err := cli.GetImage(ctx, ref)
+		localCtx, localCancel := imagePullContext(ctx)
+		defer localCancel()
+
+		local, err := cli.GetImage(localCtx, ref)
 		if err != nil {
 			return nil, err
 		}
-		return ensureImageUnpacked(ctx, local, snapshotter)
+		return ensureImageUnpacked(localCtx, local, snapshotter)
 	}
+
+	pullCtx, cancel := imagePullContext(ctx)
+	defer cancel()
 
 	if publish != nil {
 		publish(environment.DockerImagePullStarted, "")
@@ -184,13 +191,16 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 	}
 	pulled, err := cli.Pull(pullCtx, ref, opts...)
 	if err != nil {
-		local, localErr := cli.GetImage(ctx, ref)
+		localCtx, localCancel := imagePullContext(ctx)
+		defer localCancel()
+
+		local, localErr := cli.GetImage(localCtx, ref)
 		if localErr == nil {
 			log.WithFields(log.Fields{
 				"image": ref,
 				"err":   err.Error(),
 			}).Warn("unable to pull requested image from remote source, however the image exists locally")
-			local, unpackErr := ensureImageUnpacked(ctx, local, snapshotter)
+			local, unpackErr := ensureImageUnpacked(localCtx, local, snapshotter)
 			if unpackErr != nil {
 				return nil, unpackErr
 			}
