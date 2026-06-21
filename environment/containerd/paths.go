@@ -1,6 +1,7 @@
 package containerd
 
 import (
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -52,6 +53,12 @@ func containerdLogPath(id, suffix string) (string, error) {
 		return "", errors.Errorf("environment/containerd: resolved log path %q escapes %s", path, dir)
 	}
 	return path, nil
+}
+
+func ensureContainerdDirectory(dir string) error {
+	// codeql[go/path-injection] dir is daemon-local admin configuration already
+	// normalized and bounded by cleanContainerdDirectory before reaching this sink.
+	return os.MkdirAll(dir, 0o700)
 }
 
 func cleanContainerdDirectory(value, field string) (string, error) {

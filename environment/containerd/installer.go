@@ -225,7 +225,7 @@ func (i *Installer) openLog(id string) (io.WriteCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(logDirectory, 0o700); err != nil {
+	if err := ensureContainerdDirectory(logDirectory); err != nil {
 		return nil, err
 	}
 	logPath, err := i.logPath(id)

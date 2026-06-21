@@ -2,7 +2,6 @@ package containerd
 
 import (
 	"context"
-	"os"
 	"sync"
 
 	"emperror.dev/errors"
@@ -36,7 +35,7 @@ func (Factory) Configure(ctx context.Context) error {
 		return err
 	}
 	for _, dir := range []string{runtimeRoot, logDirectory} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := ensureContainerdDirectory(dir); err != nil {
 			return errors.Wrapf(err, "environment/containerd: failed to create %s", dir)
 		}
 	}

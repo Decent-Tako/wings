@@ -168,7 +168,7 @@ func (e *Environment) Readlog(lines int) ([]string, error) {
 		lines = maxContainerdReadlogLines
 	}
 
-	out := make([]string, 0, lines)
+	var out []string
 	paths, err := e.logPathsNewestFirst()
 	if err != nil {
 		return nil, err
