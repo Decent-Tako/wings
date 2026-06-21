@@ -23,9 +23,14 @@ import (
 )
 
 type Information struct {
-	Version string            `json:"version"`
-	Docker  DockerInformation `json:"docker"`
-	System  System            `json:"system"`
+	Version string              `json:"version"`
+	Runtime *RuntimeInformation `json:"runtime,omitempty"`
+	Docker  *DockerInformation  `json:"docker,omitempty"`
+	System  System              `json:"system"`
+}
+
+type RuntimeInformation struct {
+	Name string `json:"name"`
 }
 
 type DockerInformation struct {
@@ -100,13 +105,8 @@ type DockerDiskUsage struct {
 	BuildCacheSize int64 `json:"build_cache_size"`
 }
 
-func GetSystemInformation() (*Information, error) {
+func GetSystemInformation(containerRuntime string) (*Information, error) {
 	k, err := kernel.GetKernelVersion()
-	if err != nil {
-		return nil, err
-	}
-
-	version, info, err := GetDockerInfo(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -121,50 +121,79 @@ func GetSystemInformation() (*Information, error) {
 		os = release["PRETTY_NAME"]
 	} else if release["NAME"] != "" {
 		os = release["NAME"]
-	} else {
-		os = info.OperatingSystem
+	}
+
+	runtimeName := normalizedContainerRuntime(containerRuntime)
+	out := &Information{
+		Version: Version,
+		System: System{
+			Architecture:  runtime.GOARCH,
+			CPUThreads:    runtime.NumCPU(),
+			KernelVersion: k.String(),
+			OS:            os,
+			OSType:        runtime.GOOS,
+		},
+	}
+
+	if runtimeName != "docker" {
+		out.Runtime = &RuntimeInformation{Name: runtimeName}
+		if out.System.OS == "" {
+			out.System.OS = runtime.GOOS
+		}
+		m, err := mem.VirtualMemory()
+		if err != nil {
+			return nil, err
+		}
+		out.System.MemoryBytes = int64(m.Total)
+		return out, nil
+	}
+
+	version, info, err := GetDockerInfo(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if out.System.OS == "" {
+		out.System.OS = info.OperatingSystem
 	}
 
 	var filesystem string
 	for _, v := range info.DriverStatus {
-		if v[0] != "Backing Filesystem" {
+		if len(v) < 2 || v[0] != "Backing Filesystem" {
 			continue
 		}
 		filesystem = v[1]
 		break
 	}
 
-	return &Information{
-		Version: Version,
-		Docker: DockerInformation{
-			Version: version.Version,
-			Cgroups: DockerCgroups{
-				Driver:  info.CgroupDriver,
-				Version: info.CgroupVersion,
-			},
-			Containers: DockerContainers{
-				Total:   info.Containers,
-				Running: info.ContainersRunning,
-				Paused:  info.ContainersPaused,
-				Stopped: info.ContainersStopped,
-			},
-			Storage: DockerStorage{
-				Driver:     info.Driver,
-				Filesystem: filesystem,
-			},
-			Runc: DockerRunc{
-				Version: info.RuncCommit.ID,
-			},
+	out.Docker = &DockerInformation{
+		Version: version.Version,
+		Cgroups: DockerCgroups{
+			Driver:  info.CgroupDriver,
+			Version: info.CgroupVersion,
 		},
-		System: System{
-			Architecture:  runtime.GOARCH,
-			CPUThreads:    runtime.NumCPU(),
-			MemoryBytes:   info.MemTotal,
-			KernelVersion: k.String(),
-			OS:            os,
-			OSType:        runtime.GOOS,
+		Containers: DockerContainers{
+			Total:   info.Containers,
+			Running: info.ContainersRunning,
+			Paused:  info.ContainersPaused,
+			Stopped: info.ContainersStopped,
 		},
-	}, nil
+		Storage: DockerStorage{
+			Driver:     info.Driver,
+			Filesystem: filesystem,
+		},
+		Runc: DockerRunc{
+			Version: info.RuncCommit.ID,
+		},
+	}
+	out.System.MemoryBytes = info.MemTotal
+	return out, nil
+}
+
+func normalizedContainerRuntime(containerRuntime string) string {
+	if containerRuntime == "" {
+		return "docker"
+	}
+	return containerRuntime
 }
 
 func GetSystemIps() ([]string, error) {

@@ -21,13 +21,26 @@ import (
 
 // GenerateDiagnosticsReport collects diagnostic data and returns it as a string.
 func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines int) (string, error) {
-	dockerVersion, dockerInfo, dockerErr := getDockerInfo()
 	output := &strings.Builder{}
+
+	configLoadErr := config.FromFile(config.DefaultLocation)
+	cfg := config.Get()
+	runtimeName := cfg.ContainerRuntime
+	if runtimeName == "" {
+		runtimeName = config.ContainerRuntimeDocker
+	}
+
+	var dockerVersion types.Version
+	var dockerInfo dockerSystem.Info
+	var dockerErr error
+	if runtimeName == config.ContainerRuntimeDocker {
+		dockerVersion, dockerInfo, dockerErr = getDockerInfo()
+	}
 
 	fmt.Fprintln(output, "Pelican Wings - Diagnostics Report")
 	printHeader(output, "Versions")
 	fmt.Fprintln(output, "               Wings:", system.Version)
-	if dockerErr == nil {
+	if runtimeName == config.ContainerRuntimeDocker && dockerErr == nil {
 		fmt.Fprintln(output, "              Docker:", dockerVersion.Version)
 	}
 	if v, err := kernel.GetKernelVersion(); err == nil {
@@ -38,9 +51,12 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	}
 
 	printHeader(output, "Wings Configuration")
-	if err := config.FromFile(config.DefaultLocation); err != nil {
+	if configLoadErr != nil {
+		fmt.Fprintln(output, "   Config Load Error:", configLoadErr)
 	}
-	cfg := config.Get()
+	if runtimeName != config.ContainerRuntimeDocker {
+		fmt.Fprintln(output, "   Container Runtime:", runtimeName)
+	}
 	fmt.Fprintln(output, "      Panel Location:", redactField(cfg.PanelLocation, includeEndpoints))
 	fmt.Fprintln(output, "")
 	fmt.Fprintln(output, "  Internal Webserver:", redactField(cfg.Api.Host, includeEndpoints), ":", cfg.Api.Port)
@@ -61,37 +77,46 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	fmt.Fprintln(output, "         Server Time:", time.Now().Format(time.RFC1123Z))
 	fmt.Fprintln(output, "          Debug Mode:", cfg.Debug)
 
-	printHeader(output, "Docker: Info")
-	if dockerErr == nil {
-		fmt.Fprintln(output, "Server Version:", dockerInfo.ServerVersion)
-		fmt.Fprintln(output, "Storage Driver:", dockerInfo.Driver)
-		if dockerInfo.DriverStatus != nil {
-			for _, pair := range dockerInfo.DriverStatus {
-				fmt.Fprintf(output, "  %s: %s\n", pair[0], pair[1])
+	if runtimeName == config.ContainerRuntimeDocker {
+		printHeader(output, "Docker: Info")
+		if dockerErr == nil {
+			fmt.Fprintln(output, "Server Version:", dockerInfo.ServerVersion)
+			fmt.Fprintln(output, "Storage Driver:", dockerInfo.Driver)
+			if dockerInfo.DriverStatus != nil {
+				for _, pair := range dockerInfo.DriverStatus {
+					fmt.Fprintf(output, "  %s: %s\n", pair[0], pair[1])
+				}
 			}
-		}
-		if dockerInfo.SystemStatus != nil {
-			for _, pair := range dockerInfo.SystemStatus {
-				fmt.Fprintf(output, " %s: %s\n", pair[0], pair[1])
+			if dockerInfo.SystemStatus != nil {
+				for _, pair := range dockerInfo.SystemStatus {
+					fmt.Fprintf(output, " %s: %s\n", pair[0], pair[1])
+				}
 			}
-		}
-		fmt.Fprintln(output, "LoggingDriver:", dockerInfo.LoggingDriver)
-		fmt.Fprintln(output, " CgroupDriver:", dockerInfo.CgroupDriver)
-		if len(dockerInfo.Warnings) > 0 {
-			for _, w := range dockerInfo.Warnings {
-				fmt.Fprintln(output, w)
+			fmt.Fprintln(output, "LoggingDriver:", dockerInfo.LoggingDriver)
+			fmt.Fprintln(output, " CgroupDriver:", dockerInfo.CgroupDriver)
+			if len(dockerInfo.Warnings) > 0 {
+				for _, w := range dockerInfo.Warnings {
+					fmt.Fprintln(output, w)
+				}
 			}
+		} else {
+			fmt.Fprintln(output, dockerErr.Error())
 		}
-	} else {
-		fmt.Fprintln(output, dockerErr.Error())
-	}
 
-	printHeader(output, "Docker: Running Containers")
-	c := exec.Command("docker", "ps")
-	if co, err := c.Output(); err == nil {
-		output.Write(co)
+		printHeader(output, "Docker: Running Containers")
+		c := exec.Command("docker", "ps")
+		if co, err := c.Output(); err == nil {
+			output.Write(co)
+		} else {
+			fmt.Fprint(output, "Couldn't list containers: ", err)
+		}
 	} else {
-		fmt.Fprint(output, "Couldn't list containers: ", err)
+		printHeader(output, "Container Runtime: Info")
+		fmt.Fprintln(output, "             Runtime:", runtimeName)
+		fmt.Fprintln(output, "    Containerd Addr.:", cfg.Containerd.Address)
+		fmt.Fprintln(output, "           Namespace:", cfg.Containerd.Namespace)
+		fmt.Fprintln(output, "          Snapshotter:", cfg.Containerd.Snapshotter)
+		fmt.Fprintln(output, "         OCI Runtime:", cfg.Containerd.Runtime)
 	}
 
 	printHeader(output, "Latest Wings Logs")

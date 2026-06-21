@@ -29,6 +29,7 @@ import (
 
 	"github.com/pelican-dev/wings/config"
 	"github.com/pelican-dev/wings/environment"
+	envruntime "github.com/pelican-dev/wings/environment/runtime"
 	"github.com/pelican-dev/wings/internal/cron"
 	"github.com/pelican-dev/wings/internal/database"
 	"github.com/pelican-dev/wings/loggers/cli"
@@ -43,6 +44,8 @@ var (
 	configPath = config.DefaultLocation
 	debug      = false
 )
+
+var errDockerSnap = errors.New("Docker Snap installation detected")
 
 var rootCommand = &cobra.Command{
 	Use:   "wings",
@@ -92,21 +95,36 @@ func init() {
 	rootCommand.AddCommand(newSelfupdateCommand())
 }
 
-func isDockerSnap() bool {
+func isDockerSnap() (bool, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Fatalf("Unable to initialize Docker client: %s", err)
+		return false, fmt.Errorf("unable to initialize Docker client: %w", err)
 	}
 
 	defer cli.Close() // Close the client when the function returns (should not be needed, but just to be safe)
 
 	info, err := cli.Info(context.Background())
 	if err != nil {
-		log.Fatalf("Unable to get Docker info: %s", err)
+		return false, fmt.Errorf("unable to get Docker info: %w", err)
 	}
 
 	// Check if Docker root directory contains '/var/snap/docker'
-	return strings.Contains(info.DockerRootDir, "/var/snap/docker")
+	return strings.Contains(info.DockerRootDir, "/var/snap/docker"), nil
+}
+
+func runDockerStartupChecks(runtime config.ContainerRuntime, snapCheck func() (bool, error)) error {
+	if runtime != "" && runtime != config.ContainerRuntimeDocker {
+		return nil
+	}
+
+	ok, err := snapCheck()
+	if err != nil {
+		return err
+	}
+	if ok {
+		return errDockerSnap
+	}
+	return nil
 }
 
 func rootCmdRun(cmd *cobra.Command, _ []string) {
@@ -114,9 +132,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	log.Debug("running in debug mode")
 	log.WithField("config_file", configPath).Info("loading configuration from file")
 
-	if isDockerSnap() {
-		log.Error("Docker Snap installation detected. Exiting...")
-		os.Exit(1)
+	if err := runDockerStartupChecks(config.Get().ContainerRuntime, isDockerSnap); err != nil {
+		if errors.Is(err, errDockerSnap) {
+			log.WithField("error", err).Fatal("Docker Snap installation detected. Exiting...")
+		}
+		log.WithField("error", err).Fatal("failed Docker startup checks")
 	}
 
 	if ok, _ := cmd.Flags().GetBool("ignore-certificate-errors"); ok {
@@ -173,10 +193,11 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		return
 	}
 
-	if err := environment.ConfigureDocker(cmd.Context()); err != nil {
-		log.WithField("error", err).Fatal("failed to configure docker environment")
+	if err := envruntime.ConfigureSelected(cmd.Context()); err != nil {
+		log.WithField("error", err).Fatal("failed to configure container runtime environment")
 		return
 	}
+	defer closeSelectedRuntime()
 
 	if err := config.WriteToDisk(config.Get()); err != nil {
 		if !errors.Is(err, syscall.EROFS) {
@@ -303,7 +324,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	}()
 
 	if s, err := cron.Scheduler(cmd.Context(), manager); err != nil {
-		log.WithField("error", err).Fatal("failed to initialize cron system")
+		fatalAfterRuntime(log.WithField("error", err), "failed to initialize cron system")
 	} else {
 		log.WithField("subsystem", "cron").Info("starting cron processes")
 		s.Start()
@@ -312,7 +333,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	go func() {
 		// Run the SFTP server.
 		if err := sftp.New(manager).Run(); err != nil {
-			log.WithError(err).Fatal("failed to initialize the sftp server")
+			fatalAfterRuntime(log.WithError(err), "failed to initialize the sftp server")
 			return
 		}
 	}()
@@ -395,7 +416,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		}()
 		// Start the main http server with TLS using autocert.
 		if err := s.ListenAndServeTLS("", ""); err != nil {
-			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}).Fatal("failed to configure HTTP server using auto-tls")
+			fatalAfterRuntime(log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}), "failed to configure HTTP server using auto-tls")
 		}
 		return
 	}
@@ -404,14 +425,25 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// config on the server and then serve it over normal HTTP.
 	if api.Ssl.Enabled {
 		if err := s.ListenAndServeTLS(api.Ssl.CertificateFile, api.Ssl.KeyFile); err != nil {
-			log.WithFields(log.Fields{"auto_tls": false, "error": err}).Fatal("failed to configure HTTPS server")
+			fatalAfterRuntime(log.WithFields(log.Fields{"auto_tls": false, "error": err}), "failed to configure HTTPS server")
 		}
 		return
 	}
 	s.TLSConfig = nil
 	if err := s.ListenAndServe(); err != nil {
-		log.WithField("error", err).Fatal("failed to configure HTTP server")
+		fatalAfterRuntime(log.WithField("error", err), "failed to configure HTTP server")
 	}
+}
+
+func closeSelectedRuntime() {
+	if err := envruntime.CloseSelected(); err != nil {
+		log.WithField("error", err).Warn("failed to close container runtime environment")
+	}
+}
+
+func fatalAfterRuntime(entry *log.Entry, message string) {
+	closeSelectedRuntime()
+	entry.Fatal(message)
 }
 
 // Reads the configuration from the disk and then sets up the global singleton

@@ -356,6 +356,13 @@ type Configuration struct {
 	System SystemConfiguration `json:"system" yaml:"system"`
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
+	// ContainerRuntime selects which container runtime backend should be used
+	// for server process environments. Docker remains the default for existing
+	// installations. The runtime is fixed at Wings startup; change this value
+	// on disk and restart Wings to switch backends.
+	ContainerRuntime ContainerRuntime        `default:"docker" json:"container_runtime" yaml:"container_runtime"`
+	Containerd       ContainerdConfiguration `json:"containerd" yaml:"containerd"`
+
 	// Defines internal throttling configurations for server processes to prevent
 	// someone from running an endless loop that spams data to logs.
 	Throttles ConsoleThrottles
@@ -420,6 +427,7 @@ func NewAtPath(path string) (*Configuration, error) {
 func Set(c *Configuration) {
 	mu.Lock()
 	defer mu.Unlock()
+	applyRuntimeDefaults(c)
 	token := c.Token.Token
 	if token == "" {
 		c.Token.Token = c.AuthenticationToken
@@ -465,6 +473,28 @@ func Update(callback func(c *Configuration)) {
 	mu.Lock()
 	defer mu.Unlock()
 	callback(_config)
+	applyRuntimeDefaults(_config)
+}
+
+func applyRuntimeDefaults(c *Configuration) {
+	if c.ContainerRuntime != ContainerRuntimeContainerd {
+		return
+	}
+
+	dataRoot := filepath.Clean(c.System.Data)
+	if filepath.Base(dataRoot) == "volumes" {
+		dataRoot = filepath.Dir(dataRoot)
+	}
+	if dataRoot == "." || dataRoot == string(filepath.Separator) {
+		dataRoot = c.System.RootDirectory
+	}
+
+	if c.System.User.Passwd.Directory == "" || c.System.User.Passwd.Directory == "/etc/pelican" {
+		c.System.User.Passwd.Directory = filepath.Join(dataRoot, "etc", "passwd")
+	}
+	if c.System.MachineID.Directory == "" || c.System.MachineID.Directory == "/etc/pelican/machine-id" {
+		c.System.MachineID.Directory = filepath.Join(dataRoot, "etc", "machine-id")
+	}
 }
 
 // GetJwtAlgorithm returns the in-memory JWT algorithm.

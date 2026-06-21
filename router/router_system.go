@@ -22,7 +22,7 @@ import (
 
 // Returns information about the system that wings is running on.
 func getSystemInformation(c *gin.Context) {
-	i, err := system.GetSystemInformation()
+	i, err := system.GetSystemInformation(string(config.Get().ContainerRuntime))
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -126,8 +126,23 @@ func getSystemUtilization(c *gin.Context) {
 	c.JSON(http.StatusOK, u)
 }
 
+const containerdUnsupportedDockerSystemMessage = "Docker disk usage and image prune endpoints are not supported when container_runtime is containerd."
+
+func abortUnsupportedDockerSystemEndpoint(c *gin.Context) bool {
+	if config.Get().ContainerRuntime != config.ContainerRuntimeContainerd {
+		return false
+	}
+	c.AbortWithStatusJSON(http.StatusNotImplemented, gin.H{
+		"error": containerdUnsupportedDockerSystemMessage,
+	})
+	return true
+}
+
 // Returns docker disk utilization
 func getDockerDiskUsage(c *gin.Context) {
+	if abortUnsupportedDockerSystemEndpoint(c) {
+		return
+	}
 	d, err := system.GetDockerDiskUsage(c)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
@@ -138,6 +153,9 @@ func getDockerDiskUsage(c *gin.Context) {
 
 // Prunes the docker image cache
 func pruneDockerImages(c *gin.Context) {
+	if abortUnsupportedDockerSystemEndpoint(c) {
+		return
+	}
 	p, err := system.PruneDockerImages(c)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)

@@ -189,6 +189,14 @@ func (e *Environment) SetImage(i string) {
 	e.meta.Image = i
 }
 
+func (e *Environment) SetProcessMetadata(m environment.ProcessMetadata) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.meta.Image = m.Image
+	e.meta.Stop = m.Stop
+}
+
 func (e *Environment) State() string {
 	return e.st.Load()
 }

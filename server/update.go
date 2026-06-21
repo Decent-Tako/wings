@@ -3,8 +3,6 @@ package server
 import (
 	"time"
 
-	"github.com/pelican-dev/wings/environment/docker"
-
 	"github.com/pelican-dev/wings/environment"
 )
 
@@ -31,12 +29,14 @@ func (s *Server) SyncWithEnvironment() {
 		Labels:      cfg.Labels,
 	})
 
-	// For Docker specific environments we also want to update the configured image
-	// and stop configuration.
-	if e, ok := s.Environment.(*docker.Environment); ok {
-		s.Log().Debug("syncing stop configuration with configured docker environment")
-		e.SetImage(cfg.Container.Image)
-		e.SetStopConfiguration(s.ProcessConfiguration().Stop)
+	// For environments that keep image and stop configuration outside the
+	// shared Configuration value, update the runtime metadata as well.
+	if e, ok := s.Environment.(environment.ProcessMetadataUpdater); ok {
+		s.Log().Debug("syncing stop configuration with configured process environment")
+		e.SetProcessMetadata(environment.ProcessMetadata{
+			Image: cfg.Container.Image,
+			Stop:  s.ProcessConfiguration().Stop,
+		})
 	}
 
 	// If build limits are changed, environment variables also change. Plus, any modifications to
