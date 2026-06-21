@@ -427,6 +427,7 @@ func NewAtPath(path string) (*Configuration, error) {
 func Set(c *Configuration) {
 	mu.Lock()
 	defer mu.Unlock()
+	applyRuntimeDefaults(c)
 	token := c.Token.Token
 	if token == "" {
 		c.Token.Token = c.AuthenticationToken
@@ -472,6 +473,28 @@ func Update(callback func(c *Configuration)) {
 	mu.Lock()
 	defer mu.Unlock()
 	callback(_config)
+	applyRuntimeDefaults(_config)
+}
+
+func applyRuntimeDefaults(c *Configuration) {
+	if c.ContainerRuntime != ContainerRuntimeContainerd {
+		return
+	}
+
+	dataRoot := filepath.Clean(c.System.Data)
+	if filepath.Base(dataRoot) == "volumes" {
+		dataRoot = filepath.Dir(dataRoot)
+	}
+	if dataRoot == "." || dataRoot == string(filepath.Separator) {
+		dataRoot = c.System.RootDirectory
+	}
+
+	if c.System.User.Passwd.Directory == "" || c.System.User.Passwd.Directory == "/etc/pelican" {
+		c.System.User.Passwd.Directory = filepath.Join(dataRoot, "etc", "passwd")
+	}
+	if c.System.MachineID.Directory == "" || c.System.MachineID.Directory == "/etc/pelican/machine-id" {
+		c.System.MachineID.Directory = filepath.Join(dataRoot, "etc", "machine-id")
+	}
 }
 
 // GetJwtAlgorithm returns the in-memory JWT algorithm.

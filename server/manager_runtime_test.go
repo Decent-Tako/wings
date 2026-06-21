@@ -24,6 +24,7 @@ func TestManagerInitServerSelectsContainerdRuntimeAndInstaller(t *testing.T) {
 	cfg.System.TmpDirectory = filepath.Join(dir, "tmp")
 	cfg.Containerd.RuntimeRoot = filepath.Join(dir, "containerd", "runtime")
 	cfg.Containerd.LogDirectory = filepath.Join(dir, "containerd", "logs")
+	cfg.AuthenticationToken = "test-token"
 	config.Set(cfg)
 
 	manager := NewEmptyManager(nil)

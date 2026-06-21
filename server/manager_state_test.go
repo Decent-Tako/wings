@@ -85,6 +85,7 @@ func newManagerStateTestConfig(t *testing.T) {
 		t.Fatalf("failed to create config: %v", err)
 	}
 	cfg.System.RootDirectory = dir
+	cfg.AuthenticationToken = "test-token"
 	config.Set(cfg)
 }
 

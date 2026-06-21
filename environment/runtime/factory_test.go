@@ -43,6 +43,7 @@ func TestSelectedFactoryResolvesCurrentRuntime(t *testing.T) {
 		t.Fatalf("failed to create config: %v", err)
 	}
 	cfg.ContainerRuntime = config.ContainerRuntimeDocker
+	cfg.AuthenticationToken = "test-token"
 	config.Set(cfg)
 
 	first, err := SelectedFactory()
