@@ -182,15 +182,18 @@ func (ip *InstallationProcess) Run() error {
 	}
 
 	cID, err := ip.Execute()
-	if err != nil {
-		_ = ip.RemoveContainer()
-		return err
+	if cID != "" {
+		// If this step fails, log a warning but don't exit out of the process. This is completely
+		// internal to the daemon's functionality, and does not affect the status of the server itself.
+		if afterErr := ip.AfterExecute(cID); afterErr != nil {
+			ip.Server.Log().WithField("error", afterErr).Warn("failed to complete after-execute step of installation process")
+		}
 	}
-
-	// If this step fails, log a warning but don't exit out of the process. This is completely
-	// internal to the daemon's functionality, and does not affect the status of the server itself.
-	if err := ip.AfterExecute(cID); err != nil {
-		ip.Server.Log().WithField("error", err).Warn("failed to complete after-execute step of installation process")
+	if err != nil {
+		if cID == "" {
+			_ = ip.RemoveContainer()
+		}
+		return err
 	}
 
 	return nil
@@ -362,7 +365,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	ip.Server.Events().Publish(DaemonMessageEvent, "Starting installation process, this could take a few minutes...")
 	id, err := ip.runner.Execute(ctx, spec, ip.Server.Sink(system.InstallSink).Push)
 	if err != nil {
-		return "", err
+		return id, err
 	}
 	ip.Server.Events().Publish(DaemonMessageEvent, "Installation process completed.")
 	return id, nil

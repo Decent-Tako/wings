@@ -172,7 +172,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}
 
 	if err := i.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
-		return "", err
+		return r.ID, err
 	}
 
 	streamDone := make(chan error, 1)
@@ -189,7 +189,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 			if streamErr := <-streamDone; streamErr != nil {
 				log.WithFields(log.Fields{"container_id": r.ID, "error": streamErr}).Warn("error connecting to server install stream output")
 			}
-			return "", err
+			return r.ID, err
 		}
 	case waitStatus = <-sChan:
 	}
@@ -198,7 +198,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		log.WithFields(log.Fields{"container_id": r.ID, "error": streamErr}).Warn("error connecting to server install stream output")
 	}
 	if err := installerExitError(waitStatus); err != nil {
-		return "", err
+		return r.ID, err
 	}
 	return r.ID, nil
 }

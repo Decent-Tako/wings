@@ -155,7 +155,16 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 	select {
 	case <-tctx.Done():
 		return onTimeout(tctx.Err())
-	case <-exitC:
+	case status, ok := <-exitC:
+		if !ok {
+			return nil
+		}
+		if _, _, err := status.Result(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return onTimeout(err)
+			}
+			return errors.Wrap(err, "environment/containerd: task wait returned error status")
+		}
 		return nil
 	}
 }

@@ -120,10 +120,11 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		}
 		return "", errors.Wrap(err, "environment/containerd: failed to create installer container")
 	}
+	id = spec.ID
 	cleanupSnapshotOnError = false
 
 	defer func() {
-		if err == nil {
+		if err == nil || id != "" {
 			return
 		}
 		if cleanupErr := i.Remove(context.Background(), spec.ID); cleanupErr != nil {
@@ -140,13 +141,13 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 
 	logWriter, err := i.openLog(spec.ID)
 	if err != nil {
-		return "", err
+		return id, err
 	}
 	defer logWriter.Close()
 
 	fifoRoot, err := containerdFIFORoot()
 	if err != nil {
-		return "", err
+		return id, err
 	}
 	ioOpts := []cio.Opt{
 		cio.WithFIFODir(fifoRoot),
@@ -155,12 +156,12 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}
 	task, err := container.NewTask(ctx, cio.NewCreator(ioOpts...))
 	if err != nil {
-		return "", errors.Wrap(err, "environment/containerd: failed to create installer task")
+		return id, errors.Wrap(err, "environment/containerd: failed to create installer task")
 	}
 
 	exitC, err := task.Wait(ctx)
 	if err != nil {
-		return "", errors.Wrap(err, "environment/containerd: failed to wait on installer task")
+		return id, errors.Wrap(err, "environment/containerd: failed to wait on installer task")
 	}
 
 	taskIO := task.IO()
@@ -182,21 +183,24 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}()
 
 	if err := task.Start(ctx); err != nil {
-		return "", errors.Wrap(err, "environment/containerd: failed to start installer task")
+		if _, cleanupErr := task.Delete(ctx, containerdclient.WithProcessKill); cleanupErr != nil {
+			warnContainerdCleanupError(log.WithField("installer_id", spec.ID), cleanupErr, "failed to delete containerd installer task after start error")
+		}
+		return id, errors.Wrap(err, "environment/containerd: failed to start installer task")
 	}
 
 	status := <-exitC
 	code, _, err := status.Result()
 	if err != nil {
-		return "", errors.Wrap(err, "environment/containerd: installer task exited with an error")
+		return id, errors.Wrap(err, "environment/containerd: installer task exited with an error")
 	}
 	if _, err := task.Delete(ctx); err != nil {
 		warnContainerdCleanupError(log.WithField("installer_id", spec.ID), err, "failed to delete exited containerd installer task")
 	}
 	if code != 0 {
-		return "", errors.Errorf("environment/containerd: installer task exited with code %d", code)
+		return id, errors.Errorf("environment/containerd: installer task exited with code %d", code)
 	}
-	return spec.ID, nil
+	return id, nil
 }
 
 func (i *Installer) Logs(_ context.Context, id string) (io.ReadCloser, error) {

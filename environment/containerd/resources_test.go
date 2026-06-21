@@ -38,7 +38,7 @@ func TestLinuxResourcesMapsBasicLimits(t *testing.T) {
 	if got := *resources.Memory.Limit; got <= 512*1024*1024 {
 		t.Fatalf("expected memory limit to include overhead, got %d", got)
 	}
-	if resources.Memory.Reservation == nil || *resources.Memory.Reservation != 512*1_000_000 {
+	if resources.Memory.Reservation == nil || *resources.Memory.Reservation != 512*1024*1024 {
 		t.Fatalf("expected memory reservation to match Docker units, got %+v", resources.Memory.Reservation)
 	}
 	if resources.CPU == nil || resources.CPU.Quota == nil || *resources.CPU.Quota != 200_000 {

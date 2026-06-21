@@ -328,6 +328,21 @@ func (e *Environment) logPathsNewestFirst() ([]string, error) {
 	return paths, nil
 }
 
+func (e *Environment) removeLogs() error {
+	paths, err := e.logPathsNewestFirst()
+	if err != nil {
+		return err
+	}
+
+	var firstErr error
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func truncateLog(path string) error {
 	for i := 1; i < containerdLogMaxFiles(); i++ {
 		if err := os.Remove(rotatedLogPath(path, i)); err != nil && !os.IsNotExist(err) {

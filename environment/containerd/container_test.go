@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	cgroup1 "github.com/containerd/cgroups/v3/cgroup1/stats"
 	cgroup2 "github.com/containerd/cgroups/v3/cgroup2/stats"
 	apitypes "github.com/containerd/containerd/api/types"
 	containerdclient "github.com/containerd/containerd/v2/client"
@@ -473,6 +474,29 @@ func TestWaitForStopTerminatesSlowExitWhenRequested(t *testing.T) {
 	}
 }
 
+func TestWaitForStopTerminatesWhenWaitStatusReportsDeadline(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{
+		status: containerdclient.Running,
+		waitCh: make(chan containerdclient.ExitStatus, 1),
+	}
+	task.waitCh <- *containerdclient.NewExitStatus(0, time.Now(), context.DeadlineExceeded)
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	attachContainerdTestStdin(t, env)
+	env.SetProcessMetadata(environment.ProcessMetadata{
+		Image: "example.com/server:latest",
+		Stop:  remote.ProcessStopConfiguration{Type: remote.ProcessStopCommand, Value: "stop"},
+	})
+	env.SetState(environment.ProcessRunningState)
+
+	if err := env.WaitForStop(context.Background(), time.Second, true); err != nil {
+		t.Fatalf("WaitForStop() returned error: %v", err)
+	}
+	if len(task.killed) == 0 || task.killed[len(task.killed)-1] != syscall.SIGKILL {
+		t.Fatalf("expected wait deadline status to receive SIGKILL, got %v", task.killed)
+	}
+}
+
 func TestInstallerExecuteCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	newContainerdTestConfig(t)
 	config.Update(func(c *config.Configuration) {
@@ -569,15 +593,18 @@ func TestInstallerExecuteCleansTaskAndContainerWhenStartFails(t *testing.T) {
 	}
 	installer := &Installer{client: cli}
 
-	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	id, err := installer.Execute(context.Background(), spec, func([]byte) {})
 	if err == nil || !strings.Contains(err.Error(), "failed to start installer task") {
 		t.Fatalf("expected installer start error, got %v", err)
+	}
+	if id != spec.ID {
+		t.Fatalf("expected failed installer id %q, got %q", spec.ID, id)
 	}
 	if task.deleteCalls == 0 {
 		t.Fatal("expected failed installer start to delete the task")
 	}
-	if !container.deleted {
-		t.Fatal("expected failed installer start to delete the container")
+	if container.deleted {
+		t.Fatal("expected failed installer container to remain available for log copy")
 	}
 }
 
@@ -597,15 +624,18 @@ func TestInstallerExecuteReturnsErrorForNonZeroExitCode(t *testing.T) {
 	}
 	installer := &Installer{client: cli}
 
-	_, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	id, err := installer.Execute(context.Background(), spec, func([]byte) {})
 	if err == nil || !strings.Contains(err.Error(), "exited with code 42") {
 		t.Fatalf("expected non-zero installer exit error, got %v", err)
+	}
+	if id != spec.ID {
+		t.Fatalf("expected failed installer id %q, got %q", spec.ID, id)
 	}
 	if task.deleteCalls == 0 {
 		t.Fatal("expected exited installer task to be deleted")
 	}
-	if !container.deleted {
-		t.Fatal("expected failed installer container to be removed")
+	if container.deleted {
+		t.Fatal("expected failed installer container to remain available for log copy")
 	}
 }
 
@@ -676,6 +706,59 @@ func TestPollResourcesPublishesStatsWithUnsupportedNetwork(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for pollResources to stop")
+	}
+}
+
+func TestCgroupMemoryCapsInactiveFileAtUsage(t *testing.T) {
+	cgroup1Metric := &cgroup1.Metrics{
+		Memory: &cgroup1.MemoryStat{
+			Usage:             &cgroup1.MemoryEntry{Usage: 1024},
+			TotalInactiveFile: 2048,
+		},
+	}
+	if got := cgroup1Memory(cgroup1Metric); got != 0 {
+		t.Fatalf("expected cgroup1 inactive file >= usage to report 0, got %d", got)
+	}
+
+	cgroup2Metric := &cgroup2.Metrics{
+		Memory: &cgroup2.MemoryStat{Usage: 1024, InactiveFile: 2048},
+	}
+	if got := cgroup2Memory(cgroup2Metric); got != 0 {
+		t.Fatalf("expected cgroup2 inactive file >= usage to report 0, got %d", got)
+	}
+}
+
+func TestDestroyRemovesServerLogs(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.LogMaxFiles = 2
+	})
+	container := &fakeContainer{id: env.Id, labels: map[string]string{}}
+	cli.container = container
+
+	logPath, err := env.logPath()
+	if err != nil {
+		t.Fatalf("logPath() returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("failed to create log directory: %v", err)
+	}
+	for _, path := range []string{logPath, rotatedLogPath(logPath, 1)} {
+		if err := os.WriteFile(path, []byte("old log"), 0o600); err != nil {
+			t.Fatalf("failed to write test log %s: %v", path, err)
+		}
+	}
+
+	if err := env.Destroy(); err != nil {
+		t.Fatalf("Destroy() returned error: %v", err)
+	}
+	if !container.deleted {
+		t.Fatal("expected Destroy to delete the container")
+	}
+	for _, path := range []string{logPath, rotatedLogPath(logPath, 1)} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expected log %s to be removed, stat err=%v", path, err)
+		}
 	}
 }
 

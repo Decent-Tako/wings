@@ -40,7 +40,7 @@ func withLinuxResources(resources *specs.LinuxResources) oci.SpecOpts {
 
 func linuxResources(l environment.Limits) *specs.LinuxResources {
 	limit := l.BoundedMemoryLimit()
-	reservation := l.MemoryLimit * 1_000_000
+	reservation := l.MemoryLimit * 1024 * 1024
 	swap := l.ConvertedSwap()
 	oomDisabled := !l.OOMKiller
 	pids := l.ProcessLimit()

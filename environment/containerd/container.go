@@ -116,6 +116,9 @@ func (e *Environment) Destroy() error {
 	if err := e.removeContainer(context.Background()); err != nil {
 		return err
 	}
+	if err := e.removeLogs(); err != nil {
+		return err
+	}
 	e.SetState(environment.ProcessOfflineState)
 	return nil
 }
@@ -385,13 +388,11 @@ func cgroup1Memory(data *cgroup1.Metrics) uint64 {
 		return 0
 	}
 	usage := memory.GetUsage().GetUsage()
-	if inactive := memory.GetTotalInactiveFile(); inactive > 0 && inactive < usage {
-		return usage - inactive
+	inactive := memory.GetTotalInactiveFile()
+	if inactive == 0 {
+		inactive = memory.GetInactiveFile()
 	}
-	if inactive := memory.GetInactiveFile(); inactive < usage {
-		return usage - inactive
-	}
-	return usage
+	return memoryUsageMinusInactiveFile(usage, inactive)
 }
 
 func cgroup1CPU(data *cgroup1.Metrics) uint64 {
@@ -406,11 +407,14 @@ func cgroup2Memory(data *cgroup2.Metrics) uint64 {
 	if memory == nil {
 		return 0
 	}
-	usage := memory.GetUsage()
-	if inactive := memory.GetInactiveFile(); inactive < usage {
-		return usage - inactive
+	return memoryUsageMinusInactiveFile(memory.GetUsage(), memory.GetInactiveFile())
+}
+
+func memoryUsageMinusInactiveFile(usage, inactive uint64) uint64 {
+	if inactive >= usage {
+		return 0
 	}
-	return usage
+	return usage - inactive
 }
 
 func cgroup2CPU(data *cgroup2.Metrics) uint64 {
