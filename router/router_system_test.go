@@ -18,6 +18,7 @@ func TestDockerSystemEndpointsUnsupportedUnderContainerd(t *testing.T) {
 		t.Fatalf("failed to create config: %v", err)
 	}
 	cfg.ContainerRuntime = config.ContainerRuntimeContainerd
+	cfg.AuthenticationToken = "test-token"
 	config.Set(cfg)
 	gin.SetMode(gin.TestMode)
 

@@ -14,6 +14,7 @@ func TestGenerateDiagnosticsReportSkipsDockerSectionsForContainerdRuntime(t *tes
 		t.Fatalf("failed to create config: %v", err)
 	}
 	cfg.ContainerRuntime = config.ContainerRuntimeContainerd
+	cfg.AuthenticationToken = "test-token"
 	cfg.System.LogDirectory = t.TempDir()
 	config.Set(cfg)
 

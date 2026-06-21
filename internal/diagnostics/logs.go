@@ -23,8 +23,7 @@ import (
 func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines int) (string, error) {
 	output := &strings.Builder{}
 
-	if err := config.FromFile(config.DefaultLocation); err != nil {
-	}
+	configLoadErr := config.FromFile(config.DefaultLocation)
 	cfg := config.Get()
 	runtimeName := cfg.ContainerRuntime
 	if runtimeName == "" {
@@ -52,6 +51,9 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	}
 
 	printHeader(output, "Wings Configuration")
+	if configLoadErr != nil {
+		fmt.Fprintln(output, "   Config Load Error:", configLoadErr)
+	}
 	if runtimeName != config.ContainerRuntimeDocker {
 		fmt.Fprintln(output, "   Container Runtime:", runtimeName)
 	}

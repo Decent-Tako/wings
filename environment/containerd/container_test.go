@@ -747,6 +747,7 @@ func newContainerdTestConfig(t *testing.T) {
 	cfg.Docker.Network.Driver = "bridge"
 	cfg.Docker.TmpfsSize = 64
 	cfg.Docker.ContainerPidLimit = 512
+	cfg.AuthenticationToken = "test-token"
 	cfg.Containerd.RuntimeRoot = filepath.Join(dir, "runtime")
 	cfg.Containerd.LogDirectory = filepath.Join(dir, "logs")
 	cfg.Containerd.LogMaxSize = "5m"

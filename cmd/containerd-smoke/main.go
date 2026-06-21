@@ -291,7 +291,9 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 }
 
 func cleanupRoot(root string) {
-	if root == "" || root == "/" || root == "/tmp" || root == "/var" || root == "/var/lib" {
+	root = filepath.Clean(root)
+	const prefix = "/tmp/pelican-containerd-smoke"
+	if root == "" || root == "." || root == "/" || root == "/tmp" || root == "/var" || root == "/var/lib" || (root != prefix && !strings.HasPrefix(root, prefix+string(os.PathSeparator))) {
 		fmt.Printf("SMOKE step=cleanup-root result=skip root=%q\n", root)
 		return
 	}

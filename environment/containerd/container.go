@@ -36,6 +36,9 @@ func (e *Environment) Exists() (bool, error) {
 
 func (e *Environment) Create() (err error) {
 	ctx := e.context(context.Background())
+	e.mu.RLock()
+	imageName := e.meta.Image
+	e.mu.RUnlock()
 
 	if _, err := e.client.LoadContainer(ctx, e.Id); err == nil {
 		return nil
@@ -47,7 +50,7 @@ func (e *Environment) Create() (err error) {
 		return err
 	}
 
-	image, err := e.ensureImageExists(ctx)
+	image, err := e.ensureImageExists(ctx, imageName)
 	if err != nil {
 		return errors.WithStackIf(err)
 	}
@@ -85,7 +88,7 @@ func (e *Environment) Create() (err error) {
 		ctx,
 		e.Id,
 		containerdclient.WithImage(image),
-		containerdclient.WithImageName(strings.TrimPrefix(e.meta.Image, "~")),
+		containerdclient.WithImageName(strings.TrimPrefix(imageName, "~")),
 		containerdclient.WithSnapshotter(cfg.Containerd.Snapshotter),
 		containerdclient.WithNewSnapshot(snapshotID, image),
 		containerdclient.WithNewSpec(specOpts...),
@@ -104,9 +107,11 @@ func (e *Environment) Create() (err error) {
 
 func (e *Environment) Destroy() error {
 	e.SetState(environment.ProcessStoppingState)
-	err := e.removeContainer(context.Background())
+	if err := e.removeContainer(context.Background()); err != nil {
+		return err
+	}
 	e.SetState(environment.ProcessOfflineState)
-	return err
+	return nil
 }
 
 func (e *Environment) InSituUpdate() error {
@@ -125,8 +130,8 @@ func (e *Environment) InSituUpdate() error {
 	return nil
 }
 
-func (e *Environment) ensureImageExists(ctx context.Context) (containerdclient.Image, error) {
-	return ensureContainerdImage(ctx, e.client, e.meta.Image, func(topic, data string) {
+func (e *Environment) ensureImageExists(ctx context.Context, image string) (containerdclient.Image, error) {
+	return ensureContainerdImage(ctx, e.client, image, func(topic, data string) {
 		e.Events().Publish(topic, data)
 	})
 }
@@ -138,7 +143,7 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 	defer cancel()
 
 	if strings.HasPrefix(image, "~") {
-		return cli.GetImage(pullCtx, ref)
+		return cli.GetImage(ctx, ref)
 	}
 
 	if publish != nil {
@@ -160,7 +165,7 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 	}
 	pulled, err := cli.Pull(pullCtx, ref, opts...)
 	if err != nil {
-		local, localErr := cli.GetImage(pullCtx, ref)
+		local, localErr := cli.GetImage(ctx, ref)
 		if localErr == nil {
 			log.WithFields(log.Fields{
 				"image": ref,
@@ -185,13 +190,23 @@ func imagePullContext(ctx context.Context) (context.Context, context.CancelFunc)
 }
 
 func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
+	var (
+		bestMatch       string
+		bestCredentials config.RegistryConfiguration
+	)
 	for registry, credentials := range config.Get().Docker.Registries {
 		if !strings.HasPrefix(ref, registry) {
 			continue
 		}
+		if len(registry) > len(bestMatch) {
+			bestMatch = registry
+			bestCredentials = credentials
+		}
+	}
+	if bestMatch != "" {
 		resolver := docker.NewResolver(docker.ResolverOptions{
 			Authorizer: docker.NewDockerAuthorizer(docker.WithAuthCreds(func(string) (string, string, error) {
-				return credentials.Username, credentials.Password, nil
+				return bestCredentials.Username, bestCredentials.Password, nil
 			})),
 		})
 		return containerdclient.WithResolver(resolver), true
