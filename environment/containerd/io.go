@@ -235,32 +235,52 @@ func (e *Environment) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClo
 }
 
 func (e *Environment) watchExit(waitCtx context.Context, exitC <-chan containerdclient.ExitStatus, task containerdclient.Task) {
-	status, ok := <-exitC
-	if !ok {
-		return
-	}
-
-	code, exitedAt, err := status.Result()
-	if err != nil {
-		if waitCtx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	for {
+		status, ok := <-exitC
+		if !ok {
 			return
 		}
-		e.log().WithField("error", err).Warn("containerd task exited with error status")
-		if code == 0 {
-			code = 1
+
+		code, exitedAt, err := status.Result()
+		if err != nil {
+			if waitCtx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+
+			running, inspectErr := taskIsRunning(e.context(context.Background()), task)
+			if inspectErr != nil {
+				e.log().WithField("error", err).WithField("inspect_error", inspectErr).Warn("containerd task wait failed; preserving attach state because task status is unknown")
+				return
+			}
+			if running {
+				e.log().WithField("error", err).Warn("containerd task wait failed while task is still running; retrying wait")
+				nextExitC, waitErr := task.Wait(e.context(waitCtx))
+				if waitErr != nil {
+					e.log().WithField("error", waitErr).Warn("failed to re-register containerd task wait after wait error")
+					return
+				}
+				exitC = nextExitC
+				continue
+			}
+
+			e.log().WithField("error", err).Warn("containerd task wait failed after task stopped")
+			if code == 0 {
+				code = containerdclient.UnknownExitStatus
+			}
 		}
-	}
 
-	e.mu.Lock()
-	e.lastExitCode = code
-	e.lastExitTime = exitedAt
-	e.mu.Unlock()
+		e.mu.Lock()
+		e.lastExitCode = code
+		e.lastExitTime = exitedAt
+		e.mu.Unlock()
 
-	if _, err := task.Delete(e.context(context.Background())); err != nil {
-		warnContainerdCleanupError(e.log(), err, "failed to delete exited containerd task")
+		if _, err := task.Delete(e.context(context.Background())); err != nil {
+			warnContainerdCleanupError(e.log(), err, "failed to delete exited containerd task")
+		}
+		e.closeAttach()
+		e.SetState(environment.ProcessOfflineState)
+		return
 	}
-	e.closeAttach()
-	e.SetState(environment.ProcessOfflineState)
 }
 
 func (e *Environment) closeAttach() {
@@ -420,6 +440,9 @@ func newRotatingLogWriter(path string) (io.WriteCloser, error) {
 func (w *rotatingLogWriter) Write(p []byte) (int, error) {
 	total := len(p)
 	for len(p) > 0 {
+		if w.file == nil {
+			return total - len(p), os.ErrClosed
+		}
 		if w.maxSize > 0 && w.size >= w.maxSize {
 			if err := w.rotate(); err != nil {
 				return total - len(p), err
@@ -461,6 +484,7 @@ func (w *rotatingLogWriter) rotate() error {
 		if err := w.file.Close(); err != nil {
 			return err
 		}
+		w.file = nil
 	}
 	for i := w.maxFiles - 2; i >= 1; i-- {
 		src := rotatedLogPath(w.path, i)

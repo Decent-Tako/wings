@@ -117,12 +117,13 @@ func (e *Environment) create(ctx context.Context) (err error) {
 
 func (e *Environment) Destroy() error {
 	e.SetState(environment.ProcessStoppingState)
-	if err := e.removeContainer(context.Background()); err != nil {
-		return err
-	}
-	err := e.removeLogs()
+	removeErr := e.removeContainer(context.Background())
+	logErr := e.removeLogs()
 	e.SetState(environment.ProcessOfflineState)
-	return err
+	if removeErr != nil {
+		return removeErr
+	}
+	return logErr
 }
 
 func (e *Environment) InSituUpdate() error {

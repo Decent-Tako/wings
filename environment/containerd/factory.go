@@ -15,10 +15,9 @@ import (
 type Factory struct{}
 
 var (
-	clientMu   sync.Mutex
-	clientOnce sync.Once
-	client     *containerdclient.Client
-	clientErr  error
+	clientMu  sync.Mutex
+	client    *containerdclient.Client
+	clientErr error
 )
 
 func (Factory) Configure(ctx context.Context) error {
@@ -67,9 +66,9 @@ func (Factory) Close() error {
 func Client() (*containerdclient.Client, error) {
 	clientMu.Lock()
 	defer clientMu.Unlock()
-	clientOnce.Do(func() {
+	if client == nil && clientErr == nil {
 		client, clientErr = containerdclient.New(config.Get().Containerd.Address)
-	})
+	}
 	return client, errors.Wrap(clientErr, "environment/containerd: could not create client")
 }
 
@@ -83,7 +82,6 @@ func Close() error {
 	}
 	client = nil
 	clientErr = nil
-	clientOnce = sync.Once{}
 	return errors.Wrap(err, "environment/containerd: failed to close client")
 }
 

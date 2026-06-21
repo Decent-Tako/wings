@@ -185,10 +185,32 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 		return id, errors.Wrap(err, "environment/containerd: failed to start installer task")
 	}
 
-	status := <-exitC
-	code, _, err := status.Result()
-	if err != nil {
-		return id, errors.Wrap(err, "environment/containerd: installer task exited with an error")
+	var code uint32
+	for {
+		status, ok := <-exitC
+		if !ok {
+			return id, errors.New("environment/containerd: installer task wait channel closed unexpectedly")
+		}
+		var err error
+		code, _, err = status.Result()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return id, errors.Wrap(err, "environment/containerd: installer task wait was canceled")
+		}
+		running, inspectErr := taskIsRunning(ctx, task)
+		if inspectErr != nil {
+			return id, errors.Wrap(inspectErr, "environment/containerd: could not inspect installer task after wait error")
+		}
+		if !running {
+			return id, errors.Wrap(err, "environment/containerd: installer task wait failed after task stopped")
+		}
+		log.WithField("installer_id", spec.ID).WithField("error", err).Warn("containerd installer task wait failed while task is still running; retrying wait")
+		exitC, err = task.Wait(ctx)
+		if err != nil {
+			return id, errors.Wrap(err, "environment/containerd: failed to retry installer task wait")
+		}
 	}
 	if _, err := task.Delete(ctx); err != nil {
 		warnContainerdCleanupError(log.WithField("installer_id", spec.ID), err, "failed to delete exited containerd installer task")

@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"syscall"
 	"time"
 
 	"emperror.dev/errors"
@@ -16,13 +17,7 @@ func (e *Environment) OnBeforeStart(ctx context.Context) error {
 	if err := e.removeContainer(ctx); err != nil {
 		return errors.Wrap(err, "environment/containerd: failed to remove container during pre-boot")
 	}
-	if err := e.create(ctx); err != nil {
-		if cleanupErr := e.removeContainer(context.Background()); cleanupErr != nil {
-			e.log().WithField("error", cleanupErr).Warn("failed to cleanup partially created containerd container after create error")
-		}
-		return err
-	}
-	return nil
+	return e.create(ctx)
 }
 
 func (e *Environment) Start(ctx context.Context) error {
@@ -135,7 +130,9 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 
 	onTimeout := func(err error) error {
 		if terminate {
-			return e.Terminate(context.WithoutCancel(ctx), "SIGKILL")
+			killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			return e.Terminate(killCtx, "SIGKILL")
 		}
 		return err
 	}
@@ -154,28 +151,38 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 		}
 		return errors.Wrap(err, "environment/containerd: error loading task for wait")
 	}
-	exitC, err := task.Wait(e.context(tctx))
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			return nil
-		}
-		return errors.Wrap(err, "environment/containerd: error waiting on task")
-	}
-
-	select {
-	case <-tctx.Done():
-		return onTimeout(tctx.Err())
-	case status, ok := <-exitC:
-		if !ok {
-			return nil
-		}
-		if _, _, err := status.Result(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return onTimeout(err)
+	for {
+		exitC, err := task.Wait(e.context(tctx))
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil
 			}
-			return errors.Wrap(err, "environment/containerd: task wait returned error status")
+			return errors.Wrap(err, "environment/containerd: error waiting on task")
 		}
-		return nil
+
+		select {
+		case <-tctx.Done():
+			return onTimeout(tctx.Err())
+		case status, ok := <-exitC:
+			if !ok {
+				return errors.New("environment/containerd: task wait channel closed unexpectedly")
+			}
+			if _, _, err := status.Result(); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					return onTimeout(err)
+				}
+				running, inspectErr := taskIsRunning(e.context(tctx), task)
+				if inspectErr != nil {
+					return errors.Wrap(inspectErr, "environment/containerd: could not inspect task after wait error")
+				}
+				if running {
+					e.log().WithField("error", err).Warn("containerd task wait failed while task is still running; retrying wait")
+					continue
+				}
+				return nil
+			}
+			return nil
+		}
 	}
 }
 
@@ -205,12 +212,18 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 	}
 
 	e.SetState(environment.ProcessStoppingState)
-	if err := task.Kill(e.context(ctx), signalFromString(signal)); err != nil && !errdefs.IsNotFound(err) {
+	sig := signalFromString(signal)
+	if err := task.Kill(e.context(ctx), sig); err != nil && !errdefs.IsNotFound(err) {
 		return errors.WithStack(err)
 	}
 
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
+	waitCtx := ctx
+	if _, ok := waitCtx.Deadline(); !ok && sig == syscall.SIGKILL {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(waitCtx, 10*time.Second)
+		defer cancel()
+	}
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -229,12 +242,8 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 				e.SetState(environment.ProcessOfflineState)
 				return nil
 			}
-		case <-timeout.C:
-			if err := task.Kill(e.context(ctx), signalFromString("SIGKILL")); err != nil && !errdefs.IsNotFound(err) {
-				return errors.WithStack(err)
-			}
-			e.SetState(environment.ProcessOfflineState)
-			return nil
+		case <-waitCtx.Done():
+			return errors.WithStack(waitCtx.Err())
 		}
 	}
 }
@@ -247,8 +256,15 @@ func (e *Environment) IsRunning(ctx context.Context) (bool, error) {
 		}
 		return false, err
 	}
-	status, err := task.Status(e.context(ctx))
+	return taskIsRunning(e.context(ctx), task)
+}
+
+func taskIsRunning(ctx context.Context, task containerdclient.Task) (bool, error) {
+	status, err := task.Status(ctx)
 	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	return status.Status == containerdclient.Running, nil

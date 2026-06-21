@@ -197,11 +197,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		log.WithField("error", err).Fatal("failed to configure container runtime environment")
 		return
 	}
-	defer func() {
-		if err := envruntime.CloseSelected(); err != nil {
-			log.WithField("error", err).Warn("failed to close container runtime environment")
-		}
-	}()
+	defer closeSelectedRuntime()
 
 	if err := config.WriteToDisk(config.Get()); err != nil {
 		if !errors.Is(err, syscall.EROFS) {
@@ -328,7 +324,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	}()
 
 	if s, err := cron.Scheduler(cmd.Context(), manager); err != nil {
-		log.WithField("error", err).Fatal("failed to initialize cron system")
+		fatalAfterRuntime(log.WithField("error", err), "failed to initialize cron system")
 	} else {
 		log.WithField("subsystem", "cron").Info("starting cron processes")
 		s.Start()
@@ -337,7 +333,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	go func() {
 		// Run the SFTP server.
 		if err := sftp.New(manager).Run(); err != nil {
-			log.WithError(err).Fatal("failed to initialize the sftp server")
+			fatalAfterRuntime(log.WithError(err), "failed to initialize the sftp server")
 			return
 		}
 	}()
@@ -420,7 +416,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		}()
 		// Start the main http server with TLS using autocert.
 		if err := s.ListenAndServeTLS("", ""); err != nil {
-			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}).Fatal("failed to configure HTTP server using auto-tls")
+			fatalAfterRuntime(log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}), "failed to configure HTTP server using auto-tls")
 		}
 		return
 	}
@@ -429,14 +425,25 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// config on the server and then serve it over normal HTTP.
 	if api.Ssl.Enabled {
 		if err := s.ListenAndServeTLS(api.Ssl.CertificateFile, api.Ssl.KeyFile); err != nil {
-			log.WithFields(log.Fields{"auto_tls": false, "error": err}).Fatal("failed to configure HTTPS server")
+			fatalAfterRuntime(log.WithFields(log.Fields{"auto_tls": false, "error": err}), "failed to configure HTTPS server")
 		}
 		return
 	}
 	s.TLSConfig = nil
 	if err := s.ListenAndServe(); err != nil {
-		log.WithField("error", err).Fatal("failed to configure HTTP server")
+		fatalAfterRuntime(log.WithField("error", err), "failed to configure HTTP server")
 	}
+}
+
+func closeSelectedRuntime() {
+	if err := envruntime.CloseSelected(); err != nil {
+		log.WithField("error", err).Warn("failed to close container runtime environment")
+	}
+}
+
+func fatalAfterRuntime(entry *log.Entry, message string) {
+	closeSelectedRuntime()
+	entry.Fatal(message)
 }
 
 // Reads the configuration from the disk and then sets up the global singleton

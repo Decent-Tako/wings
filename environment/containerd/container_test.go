@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -419,7 +420,7 @@ func TestWatchExitIgnoresCanceledWaitContext(t *testing.T) {
 
 func TestWatchExitRecordsNonZeroCodeForErrorStatus(t *testing.T) {
 	env, _ := newContainerdTestEnvironment(t)
-	task := &fakeTask{status: containerdclient.Running}
+	task := &fakeTask{status: containerdclient.Stopped}
 	attachContainerdTestStdin(t, env)
 	exitC := make(chan containerdclient.ExitStatus, 1)
 	exitC <- *containerdclient.NewExitStatus(0, time.Now(), io.ErrClosedPipe)
@@ -433,6 +434,56 @@ func TestWatchExitRecordsNonZeroCodeForErrorStatus(t *testing.T) {
 	}
 	if code == 0 {
 		t.Fatal("expected error exit status to be recorded as non-zero")
+	}
+}
+
+func TestWatchExitRetriesWaitErrorWhenTaskIsStillRunning(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	waitRegistered := make(chan struct{}, 1)
+	task := &fakeTask{
+		status: containerdclient.Running,
+		waitCh: make(chan containerdclient.ExitStatus),
+		waitHook: func() {
+			select {
+			case waitRegistered <- struct{}{}:
+			default:
+			}
+		},
+	}
+	attachContainerdTestStdin(t, env)
+	env.SetState(environment.ProcessRunningState)
+	firstExitC := make(chan containerdclient.ExitStatus, 1)
+	firstExitC <- *containerdclient.NewExitStatus(0, time.Now(), io.ErrClosedPipe)
+	close(firstExitC)
+	waitCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.watchExit(waitCtx, firstExitC, task)
+	}()
+
+	select {
+	case <-waitRegistered:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watchExit to re-register task wait")
+	}
+	if task.deleteCalls != 0 {
+		t.Fatalf("expected wait error for running task not to delete task, got %d deletes", task.deleteCalls)
+	}
+	if !env.IsAttached() {
+		t.Fatal("expected wait error for running task to keep attach state")
+	}
+	if env.State() != environment.ProcessRunningState {
+		t.Fatalf("expected wait error for running task to preserve running state, got %q", env.State())
+	}
+
+	close(task.waitCh)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watchExit to stop after closing retried wait channel")
 	}
 }
 
@@ -507,6 +558,23 @@ func TestTerminateKillsRunningTaskAndSetsOffline(t *testing.T) {
 	}
 }
 
+func TestTerminateRespectsCallerContextBeforeEscalating(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running, stayRunningAfterKill: true}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	env.SetState(environment.ProcessRunningState)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := env.Terminate(ctx, "SIGTERM")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded from caller context, got %v", err)
+	}
+	if len(task.killed) != 1 || task.killed[0] != syscall.SIGTERM {
+		t.Fatalf("expected only the requested SIGTERM before caller timeout, got %v", task.killed)
+	}
+}
+
 func TestStartCleansCreatedTaskAndContainerWhenStartFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	task := &fakeTask{startErr: io.ErrClosedPipe}
@@ -569,6 +637,25 @@ func TestRemoveContainerPreservesTaskDeleteError(t *testing.T) {
 	err := env.removeContainer(context.Background())
 	if err != io.ErrClosedPipe {
 		t.Fatalf("expected task delete error to be preserved, got %v", err)
+	}
+}
+
+func TestDestroyMarksOfflineWhenContainerRemovalFails(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	cli.container = &fakeContainer{
+		id:        env.Id,
+		taskErr:   errdefs.ErrNotFound,
+		deleteErr: io.ErrClosedPipe,
+		labels:    map[string]string{},
+	}
+	env.SetState(environment.ProcessRunningState)
+
+	err := env.Destroy()
+	if err != io.ErrClosedPipe {
+		t.Fatalf("expected container removal error to be returned, got %v", err)
+	}
+	if env.State() != environment.ProcessOfflineState {
+		t.Fatalf("expected Destroy to mark server offline after removal error, got %q", env.State())
 	}
 }
 
@@ -806,6 +893,32 @@ func TestInstallerExecuteReturnsErrorForNonZeroExitCode(t *testing.T) {
 	}
 	if container.deleted {
 		t.Fatal("expected failed installer container to remain available for log copy")
+	}
+}
+
+func TestInstallerExecuteErrorsWhenWaitChannelCloses(t *testing.T) {
+	newContainerdTestConfig(t)
+	spec := newContainerdTestInstallationSpec(t)
+	waitCh := make(chan containerdclient.ExitStatus)
+	close(waitCh)
+	task := &fakeTask{waitCh: waitCh}
+	container := &fakeContainer{
+		id:      spec.ID,
+		newTask: task,
+		labels:  map[string]string{},
+	}
+	cli := &fakeClient{
+		container: container,
+		getImage:  fakeImage{name: spec.Image},
+	}
+	installer := &Installer{client: cli}
+
+	id, err := installer.Execute(context.Background(), spec, func([]byte) {})
+	if err == nil || !strings.Contains(err.Error(), "wait channel closed unexpectedly") {
+		t.Fatalf("expected closed wait channel error, got %v", err)
+	}
+	if id != spec.ID {
+		t.Fatalf("expected failed installer id %q, got %q", spec.ID, id)
 	}
 }
 
@@ -1166,17 +1279,24 @@ func attachContainerdTestStdin(t *testing.T, env *Environment) {
 
 func waitForContainerdState(t *testing.T, env *Environment, state string, timeout time.Duration) {
 	t.Helper()
+	waitForCondition(t, timeout, func() bool {
+		return env.State() == state
+	}, "state %q, got %q", state, env.State())
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, ok func() bool, msg string, args ...any) {
+	t.Helper()
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		if env.State() == state {
+		if ok() {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("timed out waiting for state %q, got %q", state, env.State())
+			t.Fatalf("timed out waiting for "+msg, args...)
 		case <-ticker.C:
 		}
 	}
@@ -1380,14 +1500,16 @@ type fakeTask struct {
 	metric    *apitypes.Metric
 	metricErr error
 
-	startCalls      int
-	startNamespace  string
-	startErr        error
-	deleteCalls     int
-	deleteNamespace string
-	deleteErr       error
-	killed          []syscall.Signal
-	killErr         error
+	startCalls           int
+	startNamespace       string
+	startErr             error
+	deleteCalls          int
+	deleteNamespace      string
+	deleteErr            error
+	killed               []syscall.Signal
+	killErr              error
+	stayRunningAfterKill bool
+	statusErr            error
 }
 
 func (f *fakeTask) ID() string { return "test-server" }
@@ -1428,7 +1550,9 @@ func (f *fakeTask) Kill(_ context.Context, signal syscall.Signal, _ ...container
 	if f.killErr != nil {
 		return f.killErr
 	}
-	f.status = containerdclient.Stopped
+	if !f.stayRunningAfterKill {
+		f.status = containerdclient.Stopped
+	}
 	return nil
 }
 
@@ -1461,6 +1585,9 @@ func (f *fakeTask) Resize(context.Context, uint32, uint32) error { return nil }
 func (f *fakeTask) IO() cio.IO { return nil }
 
 func (f *fakeTask) Status(context.Context) (containerdclient.Status, error) {
+	if f.statusErr != nil {
+		return containerdclient.Status{}, f.statusErr
+	}
 	return containerdclient.Status{Status: f.status}, nil
 }
 
