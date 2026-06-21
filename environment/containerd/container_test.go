@@ -310,6 +310,38 @@ func TestRegistryResolverOptRequiresRegistryBoundary(t *testing.T) {
 	}
 }
 
+func TestRegistryResolverOptNormalizesDockerHubShortNames(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Docker.Registries = map[string]config.RegistryConfiguration{
+			"docker.io": {},
+		}
+	})
+
+	if _, ok := registryResolverOpt("ubuntu:latest"); !ok {
+		t.Fatal("expected docker.io credentials to match Docker Hub short name")
+	}
+	if _, ok := registryResolverOpt("index.docker.io/library/ubuntu:latest"); !ok {
+		t.Fatal("expected docker.io credentials to match legacy Docker Hub domain")
+	}
+}
+
+func TestRegistryResolverOptStripsConfiguredRegistryScheme(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Docker.Registries = map[string]config.RegistryConfiguration{
+			"https://ghcr.io/decent-tako/": {},
+		}
+	})
+
+	if _, ok := registryResolverOpt("ghcr.io/decent-tako/server:latest"); !ok {
+		t.Fatal("expected scheme-qualified registry config to match image ref")
+	}
+	if _, ok := registryResolverOpt("ghcr.io/other/server:latest"); ok {
+		t.Fatal("expected scheme-qualified registry config to preserve path boundary")
+	}
+}
+
 func TestCreateCleansSnapshotWhenNewContainerFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	cli.loadErr = errdefs.ErrNotFound
@@ -751,6 +783,25 @@ func TestTerminateRespectsCallerContextBeforeEscalating(t *testing.T) {
 	}
 	if len(task.killed) != 1 || task.killed[0] != syscall.SIGTERM {
 		t.Fatalf("expected only the requested SIGTERM before caller timeout, got %v", task.killed)
+	}
+}
+
+func TestTerminateUsesFallbackTimeoutWithoutCallerDeadline(t *testing.T) {
+	originalTimeout := containerdTerminateTimeout
+	containerdTerminateTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { containerdTerminateTimeout = originalTimeout })
+
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{status: containerdclient.Running, stayRunningAfterKill: true}
+	cli.container = &fakeContainer{id: env.Id, task: task, labels: map[string]string{}}
+	env.SetState(environment.ProcessRunningState)
+
+	err := env.Terminate(context.Background(), "SIGTERM")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected fallback deadline exceeded, got %v", err)
+	}
+	if len(task.killed) != 1 || task.killed[0] != syscall.SIGTERM {
+		t.Fatalf("expected requested SIGTERM before fallback timeout, got %v", task.killed)
 	}
 }
 

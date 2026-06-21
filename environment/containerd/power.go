@@ -2,7 +2,6 @@ package containerd
 
 import (
 	"context"
-	"syscall"
 	"time"
 
 	"emperror.dev/errors"
@@ -12,6 +11,8 @@ import (
 	"github.com/pelican-dev/wings/environment"
 	"github.com/pelican-dev/wings/remote"
 )
+
+var containerdTerminateTimeout = 10 * time.Second
 
 func (e *Environment) OnBeforeStart(ctx context.Context) error {
 	if err := e.removeContainer(ctx); err != nil {
@@ -218,9 +219,9 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 	}
 
 	waitCtx := ctx
-	if _, ok := waitCtx.Deadline(); !ok && sig == syscall.SIGKILL {
+	if _, ok := waitCtx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		waitCtx, cancel = context.WithTimeout(waitCtx, 10*time.Second)
+		waitCtx, cancel = context.WithTimeout(waitCtx, containerdTerminateTimeout)
 		defer cancel()
 	}
 

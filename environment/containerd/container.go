@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
+	distref "github.com/distribution/reference"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/pelican-dev/wings/config"
@@ -274,8 +276,44 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 }
 
 func registryRefMatches(ref, registry string) bool {
-	registry = strings.TrimSuffix(registry, "/")
-	return registry != "" && (ref == registry || strings.HasPrefix(ref, registry+"/"))
+	registry = normalizedRegistryPrefix(registry)
+	if registry == "" {
+		return false
+	}
+	ref = normalizedImageName(ref)
+	return ref == registry || strings.HasPrefix(ref, registry+"/")
+}
+
+func normalizedImageName(ref string) string {
+	named, err := distref.ParseNormalizedNamed(ref)
+	if err != nil {
+		return strings.TrimSuffix(ref, "/")
+	}
+	return distref.Domain(named) + "/" + distref.Path(named)
+}
+
+func normalizedRegistryPrefix(registry string) string {
+	registry = strings.TrimSpace(registry)
+	if registry == "" {
+		return ""
+	}
+	if u, err := url.Parse(registry); err == nil && u.Scheme != "" && u.Host != "" {
+		registry = u.Host + u.Path
+	}
+	registry = strings.Trim(registry, "/")
+	if registry == "" {
+		return ""
+	}
+
+	host, path, _ := strings.Cut(registry, "/")
+	host = strings.ToLower(host)
+	if host == "index.docker.io" || host == "registry-1.docker.io" {
+		host = "docker.io"
+	}
+	if path == "" {
+		return host
+	}
+	return host + "/" + strings.Trim(path, "/")
 }
 
 func hostNetworkSpecOpts() []oci.SpecOpts {
