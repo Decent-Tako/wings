@@ -15,6 +15,7 @@ import (
 
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1/stats"
 	cgroup2 "github.com/containerd/cgroups/v3/cgroup2/stats"
+	eventtypes "github.com/containerd/containerd/api/events"
 	apitypes "github.com/containerd/containerd/api/types"
 	containerdclient "github.com/containerd/containerd/v2/client"
 	containerdcontainers "github.com/containerd/containerd/v2/core/containers"
@@ -22,6 +23,7 @@ import (
 	ctrevents "github.com/containerd/containerd/v2/core/events"
 	containerdimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
+	ctrruntime "github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -992,6 +994,37 @@ func TestPollResourcesPublishesStatsWithUnsupportedNetwork(t *testing.T) {
 	}
 }
 
+func TestWatchOOMRetriesAfterSubscriptionError(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	originalRetryDelay := oomSubscribeRetryDelay
+	oomSubscribeRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { oomSubscribeRetryDelay = originalRetryDelay })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.watchOOM(ctx)
+	}()
+
+	cli.errs <- io.ErrClosedPipe
+	cli.events <- containerdOOMEnvelope(t, env.Id)
+
+	waitForCondition(t, time.Second, func() bool {
+		env.mu.RLock()
+		defer env.mu.RUnlock()
+		return env.lastOOM
+	}, "OOM event after subscription retry")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for watchOOM to stop")
+	}
+}
+
 func TestCgroupMemoryCapsInactiveFileAtUsage(t *testing.T) {
 	cgroup1Metric := &cgroup1.Metrics{
 		Memory: &cgroup1.MemoryStat{
@@ -1256,6 +1289,18 @@ func cgroup2Metric(t *testing.T, usage, inactiveFile, cpuUsec uint64) *apitypes.
 		t.Fatalf("failed to marshal cgroup2 metric: %v", err)
 	}
 	return &apitypes.Metric{Data: data}
+}
+
+func containerdOOMEnvelope(t *testing.T, id string) *ctrevents.Envelope {
+	t.Helper()
+	evt, err := typeurl.MarshalAny(&eventtypes.TaskOOM{ContainerID: id})
+	if err != nil {
+		t.Fatalf("failed to marshal OOM event: %v", err)
+	}
+	return &ctrevents.Envelope{
+		Topic: ctrruntime.TaskOOMEventTopic,
+		Event: evt,
+	}
 }
 
 func attachContainerdTestStdin(t *testing.T, env *Environment) {

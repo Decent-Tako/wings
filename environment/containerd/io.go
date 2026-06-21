@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -27,6 +28,8 @@ import (
 )
 
 const maxContainerdReadlogLines = 10_000
+
+var oomSubscribeRetryDelay = time.Second
 
 func (e *Environment) Attach(ctx context.Context) error {
 	e.mu.RLock()
@@ -322,37 +325,57 @@ func (e *Environment) closeAttach() {
 }
 
 func (e *Environment) watchOOM(ctx context.Context) {
-	events, errs := e.client.Subscribe(e.context(ctx), `topic=="/tasks/oom"`)
 	for {
+		events, errs := e.client.Subscribe(e.context(ctx), `topic=="/tasks/oom"`)
+		retry := false
+		for !retry {
+			select {
+			case <-ctx.Done():
+				return
+			case err, ok := <-errs:
+				if ok && (err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					return
+				}
+				if ok {
+					e.log().WithField("error", err).Warn("containerd OOM event subscription stopped; retrying")
+				} else {
+					e.log().Warn("containerd OOM event subscription closed; retrying")
+				}
+				retry = true
+			case event, ok := <-events:
+				if !ok {
+					e.log().Warn("containerd OOM event stream closed; retrying")
+					retry = true
+					continue
+				}
+				if event == nil || event.Event == nil || event.Topic != ctrruntime.TaskOOMEventTopic {
+					continue
+				}
+				var oom eventtypes.TaskOOM
+				if err := typeurl.UnmarshalTo(event.Event, &oom); err != nil {
+					e.log().WithField("error", err).Warn("could not decode containerd OOM event")
+					continue
+				}
+				if oom.ContainerID != e.Id {
+					continue
+				}
+				e.mu.Lock()
+				e.lastOOM = true
+				e.mu.Unlock()
+			}
+		}
+
+		timer := time.NewTimer(oomSubscribeRetryDelay)
 		select {
 		case <-ctx.Done():
-			return
-		case err, ok := <-errs:
-			if !ok {
-				return
-			}
-			if err != nil && !errors.Is(err, context.Canceled) {
-				e.log().WithField("error", err).Warn("containerd OOM event subscription stopped")
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			return
-		case event, ok := <-events:
-			if !ok {
-				return
-			}
-			if event == nil || event.Event == nil || event.Topic != ctrruntime.TaskOOMEventTopic {
-				continue
-			}
-			var oom eventtypes.TaskOOM
-			if err := typeurl.UnmarshalTo(event.Event, &oom); err != nil {
-				e.log().WithField("error", err).Warn("could not decode containerd OOM event")
-				continue
-			}
-			if oom.ContainerID != e.Id {
-				continue
-			}
-			e.mu.Lock()
-			e.lastOOM = true
-			e.mu.Unlock()
+		case <-timer.C:
 		}
 	}
 }
