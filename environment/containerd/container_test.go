@@ -142,6 +142,43 @@ func TestEnsureContainerdImageFallsBackToLocalImageAfterPullFailure(t *testing.T
 	}
 }
 
+func TestEnsureContainerdImageUnpacksLocalImage(t *testing.T) {
+	newContainerdTestConfig(t)
+	unpacked := false
+	unpackCalls := 0
+	cli := &fakeClient{
+		getImage: fakeImage{name: "local/server:latest", unpacked: &unpacked, unpackCalls: &unpackCalls},
+	}
+
+	img, err := ensureContainerdImage(context.Background(), cli, "~local/server:latest", nil)
+	if err != nil {
+		t.Fatalf("ensureContainerdImage() returned error: %v", err)
+	}
+	if img.Name() != "local/server:latest" {
+		t.Fatalf("expected local image, got %q", img.Name())
+	}
+	if unpackCalls != 1 {
+		t.Fatalf("expected local image to be unpacked once, got %d calls", unpackCalls)
+	}
+}
+
+func TestEnsureContainerdImageUnpacksFallbackImageAfterPullFailure(t *testing.T) {
+	newContainerdTestConfig(t)
+	unpacked := false
+	unpackCalls := 0
+	cli := &fakeClient{
+		pullErr:  io.ErrUnexpectedEOF,
+		getImage: fakeImage{name: "example.com/server:latest", unpacked: &unpacked, unpackCalls: &unpackCalls},
+	}
+
+	if _, err := ensureContainerdImage(context.Background(), cli, "example.com/server:latest", nil); err != nil {
+		t.Fatalf("ensureContainerdImage() returned error: %v", err)
+	}
+	if unpackCalls != 1 {
+		t.Fatalf("expected fallback image to be unpacked once, got %d calls", unpackCalls)
+	}
+}
+
 func TestEnsureContainerdImageDoesNotPublishCompletedAfterPullFailure(t *testing.T) {
 	newContainerdTestConfig(t)
 	cli := &fakeClient{
@@ -192,6 +229,22 @@ func TestRegistryResolverOptSkipsUnmatchedPublicImage(t *testing.T) {
 	}
 	if opt != nil {
 		t.Fatalf("expected nil resolver opt for unmatched public image, got %v", opt)
+	}
+}
+
+func TestRegistryResolverOptRequiresRegistryBoundary(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Docker.Registries = map[string]config.RegistryConfiguration{
+			"ghcr.io": {Username: "user", Password: "pass"},
+		}
+	})
+
+	if _, ok := registryResolverOpt("ghcr.io.malicious.example/library/server:latest"); ok {
+		t.Fatal("expected registry credentials not to match a hostname prefix")
+	}
+	if _, ok := registryResolverOpt("ghcr.io/decent-tako/server:latest"); !ok {
+		t.Fatal("expected registry credentials to match on a path boundary")
 	}
 }
 
@@ -416,7 +469,7 @@ func TestStartReattachesRunningTaskAndRestoresStartedAt(t *testing.T) {
 	}
 }
 
-func TestStartMarksOfflineWhenRunningTaskReattachFails(t *testing.T) {
+func TestStartPreservesRunningStateWhenRunningTaskReattachFails(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	task := &fakeTask{
 		status:  containerdclient.Running,
@@ -432,8 +485,8 @@ func TestStartMarksOfflineWhenRunningTaskReattachFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "failed to wait on task") {
 		t.Fatalf("expected reattach wait error, got %v", err)
 	}
-	if env.State() != environment.ProcessOfflineState {
-		t.Fatalf("expected failed reattach to leave environment offline, got %q", env.State())
+	if env.State() != environment.ProcessRunningState {
+		t.Fatalf("expected failed reattach to preserve running state while task is live, got %q", env.State())
 	}
 }
 
@@ -500,6 +553,22 @@ func TestRemoveContainerIsIdempotent(t *testing.T) {
 	}
 	if err := env.removeContainer(context.Background()); err != nil {
 		t.Fatalf("expected already-deleted container removal to be nil, got %v", err)
+	}
+}
+
+func TestRemoveContainerPreservesTaskDeleteError(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{deleteErr: io.ErrClosedPipe}
+	cli.container = &fakeContainer{
+		id:        env.Id,
+		task:      task,
+		deleteErr: io.ErrUnexpectedEOF,
+		labels:    map[string]string{},
+	}
+
+	err := env.removeContainer(context.Background())
+	if err != io.ErrClosedPipe {
+		t.Fatalf("expected task delete error to be preserved, got %v", err)
 	}
 }
 
@@ -975,6 +1044,18 @@ func TestContainerdUserIDRejectsOutOfRangeValues(t *testing.T) {
 	}
 }
 
+func TestSignalFromStringDefaultsToGracefulStop(t *testing.T) {
+	if got := signalFromString(""); got != syscall.SIGTERM {
+		t.Fatalf("expected empty signal to default to SIGTERM, got %v", got)
+	}
+	if got := signalFromString("^C"); got != syscall.SIGINT {
+		t.Fatalf("expected ^C to map to SIGINT, got %v", got)
+	}
+	if got := signalFromString("definitely-not-a-signal"); got != syscall.SIGTERM {
+		t.Fatalf("expected unknown signal to default to SIGTERM, got %v", got)
+	}
+}
+
 func newContainerdTestEnvironment(t *testing.T) (*Environment, *fakeClient) {
 	t.Helper()
 	newContainerdTestConfig(t)
@@ -1413,7 +1494,10 @@ func (f *fakeTask) Metrics(context.Context) (*apitypes.Metric, error) {
 func (f *fakeTask) Spec(context.Context) (*oci.Spec, error) { return &oci.Spec{}, nil }
 
 type fakeImage struct {
-	name string
+	name        string
+	unpacked    *bool
+	unpackCalls *int
+	unpackErr   error
 }
 
 func (f fakeImage) Name() string { return f.name }
@@ -1424,7 +1508,18 @@ func (f fakeImage) Target() ocispec.Descriptor {
 
 func (f fakeImage) Labels() map[string]string { return nil }
 
-func (f fakeImage) Unpack(context.Context, string, ...containerdclient.UnpackOpt) error { return nil }
+func (f fakeImage) Unpack(context.Context, string, ...containerdclient.UnpackOpt) error {
+	if f.unpackCalls != nil {
+		*f.unpackCalls = *f.unpackCalls + 1
+	}
+	if f.unpackErr != nil {
+		return f.unpackErr
+	}
+	if f.unpacked != nil {
+		*f.unpacked = true
+	}
+	return nil
+}
 
 func (f fakeImage) RootFS(context.Context) ([]digest.Digest, error) { return nil, nil }
 
@@ -1438,7 +1533,12 @@ func (f fakeImage) Config(context.Context) (ocispec.Descriptor, error) {
 	return ocispec.Descriptor{}, nil
 }
 
-func (f fakeImage) IsUnpacked(context.Context, string) (bool, error) { return true, nil }
+func (f fakeImage) IsUnpacked(context.Context, string) (bool, error) {
+	if f.unpacked == nil {
+		return true, nil
+	}
+	return *f.unpacked, nil
+}
 
 func (f fakeImage) ContentStore() content.Store { return nil }
 

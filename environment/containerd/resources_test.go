@@ -102,6 +102,28 @@ func TestLinuxResourcesPreservesExplicitUnlimitedSwap(t *testing.T) {
 	}
 }
 
+func TestLinuxResourcesSwapTotalIncludesBoundedLimit(t *testing.T) {
+	cfg, err := config.NewAtPath("/tmp/wings.yml")
+	if err != nil {
+		t.Fatalf("failed to create config: %v", err)
+	}
+	cfg.AuthenticationToken = "test-token"
+	config.Set(cfg)
+
+	resources := linuxResources(environment.Limits{
+		MemoryLimit: 512,
+		Swap:        0,
+		OOMKiller:   true,
+	})
+
+	if resources.Memory == nil || resources.Memory.Limit == nil || resources.Memory.Swap == nil {
+		t.Fatal("expected memory limit and swap total to be set")
+	}
+	if *resources.Memory.Swap < *resources.Memory.Limit {
+		t.Fatalf("expected swap total %d to be at least memory limit %d", *resources.Memory.Swap, *resources.Memory.Limit)
+	}
+}
+
 func TestResourceSpecOptsApplyCompleteLinuxResources(t *testing.T) {
 	reservation := int64(256 * 1024 * 1024)
 	limit := int64(512 * 1024 * 1024)

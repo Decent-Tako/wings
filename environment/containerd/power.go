@@ -48,8 +48,13 @@ func (e *Environment) Start(ctx context.Context) error {
 		e.startedAtOrRestore(ctx, time.Now())
 		e.SetState(environment.ProcessRunningState)
 		if err := e.Attach(ctx); err != nil {
-			e.SetState(environment.ProcessStoppingState)
-			e.SetState(environment.ProcessOfflineState)
+			stillRunning, inspectErr := e.IsRunning(ctx)
+			if inspectErr != nil {
+				e.log().WithField("error", inspectErr).Warn("failed to inspect containerd task after reattach error")
+			} else if !stillRunning {
+				e.SetState(environment.ProcessStoppingState)
+				e.SetState(environment.ProcessOfflineState)
+			}
 			return err
 		}
 		return nil

@@ -557,7 +557,7 @@ func signalFromString(value string) syscall.Signal {
 	switch strings.ToUpper(value) {
 	case "SIGABRT":
 		return syscall.SIGABRT
-	case "SIGINT", "C":
+	case "SIGINT", "C", "^C":
 		return syscall.SIGINT
 	case "SIGTERM":
 		return syscall.SIGTERM
@@ -567,6 +567,6 @@ func signalFromString(value string) syscall.Signal {
 		if n, err := strconv.Atoi(value); err == nil {
 			return syscall.Signal(n)
 		}
-		return syscall.SIGKILL
+		return syscall.SIGTERM
 	}
 }

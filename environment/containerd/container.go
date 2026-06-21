@@ -152,9 +152,14 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 	ref := strings.TrimPrefix(image, "~")
 	pullCtx, cancel := imagePullContext(ctx)
 	defer cancel()
+	snapshotter := config.Get().Containerd.Snapshotter
 
 	if strings.HasPrefix(image, "~") {
-		return cli.GetImage(ctx, ref)
+		local, err := cli.GetImage(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		return ensureImageUnpacked(ctx, local, snapshotter)
 	}
 
 	if publish != nil {
@@ -181,6 +186,10 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 				"image": ref,
 				"err":   err.Error(),
 			}).Warn("unable to pull requested image from remote source, however the image exists locally")
+			local, unpackErr := ensureImageUnpacked(ctx, local, snapshotter)
+			if unpackErr != nil {
+				return nil, unpackErr
+			}
 			if publish != nil {
 				publish(environment.DockerImagePullCompleted, "")
 			}
@@ -193,6 +202,20 @@ func ensureContainerdImage(ctx context.Context, cli clientAPI, image string, pub
 		publish(environment.DockerImagePullCompleted, "")
 	}
 	return pulled, nil
+}
+
+func ensureImageUnpacked(ctx context.Context, image containerdclient.Image, snapshotter string) (containerdclient.Image, error) {
+	unpacked, err := image.IsUnpacked(ctx, snapshotter)
+	if err != nil {
+		return nil, errors.Wrap(err, "environment/containerd: failed to inspect local image unpack status")
+	}
+	if unpacked {
+		return image, nil
+	}
+	if err := image.Unpack(ctx, snapshotter); err != nil {
+		return nil, errors.Wrap(err, "environment/containerd: failed to unpack local image")
+	}
+	return image, nil
 }
 
 func imagePullContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -209,7 +232,7 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 		bestCredentials config.RegistryConfiguration
 	)
 	for registry, credentials := range config.Get().Docker.Registries {
-		if !strings.HasPrefix(ref, registry) {
+		if !registryRefMatches(ref, registry) {
 			continue
 		}
 		if len(registry) > len(bestMatch) {
@@ -228,6 +251,11 @@ func registryResolverOpt(ref string) (containerdclient.RemoteOpt, bool) {
 	// No configured registry credentials matched. Leaving the resolver unset
 	// intentionally preserves containerd's default anonymous/public pull path.
 	return nil, false
+}
+
+func registryRefMatches(ref, registry string) bool {
+	registry = strings.TrimSuffix(registry, "/")
+	return registry != "" && (ref == registry || strings.HasPrefix(ref, registry+"/"))
 }
 
 func hostNetworkSpecOpts() []oci.SpecOpts {
@@ -359,7 +387,11 @@ func (e *Environment) removeContainer(ctx context.Context) error {
 
 	e.closeAttach()
 	if err := c.Delete(ctx, containerdclient.WithSnapshotCleanup); err != nil {
-		return warnContainerdCleanupError(e.log(), err, "failed to delete containerd container during container removal")
+		containerErr := warnContainerdCleanupError(e.log(), err, "failed to delete containerd container during container removal")
+		if firstErr != nil {
+			return firstErr
+		}
+		return containerErr
 	}
 	return firstErr
 }

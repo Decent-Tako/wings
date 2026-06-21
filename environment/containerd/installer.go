@@ -134,7 +134,11 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	if err != nil {
 		return id, err
 	}
-	defer logWriter.Close()
+	defer func() {
+		if logWriter != nil {
+			_ = logWriter.Close()
+		}
+	}()
 
 	fifoRoot, err := containerdFIFORoot()
 	if err != nil {
@@ -164,10 +168,11 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	}()
 
 	done := make(chan struct{})
-	go func() {
+	go func(writer io.WriteCloser) {
 		defer close(done)
-		i.consumeOutput(stdoutR, logWriter, output)
-	}()
+		i.consumeOutput(stdoutR, writer, output)
+	}(logWriter)
+	logWriter = nil
 	defer func() {
 		_ = stdoutW.Close()
 		<-done
