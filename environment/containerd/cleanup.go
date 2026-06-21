@@ -21,7 +21,7 @@ func warnContainerdCleanupError(entry *log.Entry, err error, message string) err
 }
 
 func containerdCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(WithNamespace(ctx), containerdCleanupTimeout)
+	return context.WithTimeout(WithNamespace(context.WithoutCancel(ctx)), containerdCleanupTimeout)
 }
 
 func cleanupContainerdSnapshot(ctx context.Context, cli clientAPI, snapshotter, snapshotID string, entry *log.Entry) error {

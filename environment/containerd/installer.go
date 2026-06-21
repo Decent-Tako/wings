@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -217,6 +218,7 @@ func (i *Installer) Execute(ctx context.Context, spec environment.InstallationSp
 	if _, err := task.Delete(ctx); err != nil {
 		warnContainerdCleanupError(log.WithField("installer_id", spec.ID), err, "failed to delete exited containerd installer task")
 	}
+	waitContainerdIO(taskIO, 5*time.Second, log.WithField("installer_id", spec.ID))
 	if code != 0 {
 		return id, errors.Errorf("environment/containerd: installer task exited with code %d", code)
 	}
@@ -239,8 +241,35 @@ func (i *Installer) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClose
 	defer stdout.Close()
 	defer logWriter.Close()
 
-	if err := system.ScanReader(io.TeeReader(stdout, logWriter), output); err != nil && err != io.EOF {
+	reader := io.TeeReader(stdout, &bestEffortLogWriter{
+		writer: logWriter,
+		warn: func(err error) {
+			log.WithField("error", err).Warn("failed to write containerd installer log; output stream will continue")
+		},
+	})
+	if err := system.ScanReader(reader, output); err != nil && err != io.EOF {
 		log.WithField("error", err).Warn("error processing scanner line in containerd installer output")
+	}
+}
+
+func waitContainerdIO(taskIO cio.IO, timeout time.Duration, entry *log.Entry) {
+	if taskIO == nil {
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		taskIO.Wait()
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+		entry.Warn("timed out waiting for containerd IO to drain")
 	}
 }
 

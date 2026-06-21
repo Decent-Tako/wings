@@ -226,7 +226,13 @@ func (e *Environment) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClo
 	defer stdout.Close()
 	defer logWriter.Close()
 
-	if err := system.ScanReader(io.TeeReader(stdout, logWriter), func(v []byte) {
+	reader := io.TeeReader(stdout, &bestEffortLogWriter{
+		writer: logWriter,
+		warn: func(err error) {
+			log.WithField("error", err).WithField("container_id", e.Id).Warn("failed to write container output log; console stream will continue")
+		},
+	})
+	if err := system.ScanReader(reader, func(v []byte) {
 		e.logCallbackMx.Lock()
 		defer e.logCallbackMx.Unlock()
 		if e.logCallback != nil {
@@ -235,6 +241,29 @@ func (e *Environment) consumeOutput(stdout *io.PipeReader, logWriter io.WriteClo
 	}); err != nil && err != io.EOF {
 		log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
 	}
+}
+
+type bestEffortLogWriter struct {
+	writer io.Writer
+	warn   func(error)
+	warned bool
+}
+
+func (w *bestEffortLogWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if err == nil && n == len(p) {
+		return n, nil
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	if !w.warned {
+		w.warned = true
+		if w.warn != nil {
+			w.warn(err)
+		}
+	}
+	return len(p), nil
 }
 
 func (e *Environment) watchExit(waitCtx context.Context, exitC <-chan containerdclient.ExitStatus, task containerdclient.Task) {
@@ -518,7 +547,9 @@ func (w *rotatingLogWriter) Close() error {
 	if w.file == nil {
 		return nil
 	}
-	return w.file.Close()
+	err := w.file.Close()
+	w.file = nil
+	return err
 }
 
 func (w *rotatingLogWriter) rotate() error {
@@ -526,7 +557,7 @@ func (w *rotatingLogWriter) rotate() error {
 	// increasing guarantees around concurrent Readlog during rotation.
 	if w.file != nil {
 		if err := w.file.Close(); err != nil {
-			return err
+			log.WithField("error", err).WithField("path", w.path).Warn("failed to close container log before rotation; continuing rotation")
 		}
 		w.file = nil
 	}
@@ -576,7 +607,8 @@ func tailFileLines(path string, max int) ([]string, error) {
 	const chunkSize int64 = 32 * 1024
 	pos := st.Size()
 	newlines := 0
-	var buf []byte
+	total := 0
+	var chunks [][]byte
 	for pos > 0 && newlines <= max {
 		readSize := chunkSize
 		if pos < readSize {
@@ -588,7 +620,13 @@ func tailFileLines(path string, max int) ([]string, error) {
 			return nil, err
 		}
 		newlines += bytes.Count(chunk, []byte{'\n'})
-		buf = append(chunk, buf...)
+		chunks = append(chunks, chunk)
+		total += len(chunk)
+	}
+
+	buf := make([]byte, 0, total)
+	for i := len(chunks) - 1; i >= 0; i-- {
+		buf = append(buf, chunks[i]...)
 	}
 
 	buf = bytes.TrimRight(buf, "\n")

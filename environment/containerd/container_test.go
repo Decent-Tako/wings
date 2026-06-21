@@ -60,6 +60,26 @@ func TestCreatePullsImageAndCreatesContainer(t *testing.T) {
 	}
 }
 
+func TestExistsUsesConfiguredNamespaceAndBoundedContext(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
+	before := time.Now()
+
+	exists, err := env.Exists()
+	if err != nil {
+		t.Fatalf("Exists() returned error: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected container to exist")
+	}
+	if cli.loadNamespace != "test-pelican" {
+		t.Fatalf("expected Exists to use namespace test-pelican, got %q", cli.loadNamespace)
+	}
+	assertContextDeadlineWithin(t, "exists load container", cli.loadCtx, before, 11*time.Second)
+}
+
 func TestCreateUsesLocalImageWhenImageIsPrefixedWithTilde(t *testing.T) {
 	env, cli := newContainerdTestEnvironment(t)
 	env.SetProcessMetadata(environment.ProcessMetadata{Image: "~local/server:latest"})
@@ -343,6 +363,27 @@ func TestImagePullContextPreservesCallerCancellation(t *testing.T) {
 	default:
 		t.Fatal("expected pull context to be canceled with caller context")
 	}
+}
+
+func TestContainerdCleanupContextIgnoresParentCancellation(t *testing.T) {
+	newContainerdTestConfig(t)
+	config.Update(func(c *config.Configuration) {
+		c.Containerd.Namespace = "test-pelican"
+	})
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	before := time.Now()
+
+	ctx, cancel := containerdCleanupContext(parent)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("expected cleanup context to survive parent cancellation, got %v", err)
+	}
+	if namespace := testContainerdNamespace(ctx); namespace != "test-pelican" {
+		t.Fatalf("expected cleanup context to use namespace test-pelican, got %q", namespace)
+	}
+	assertContextDeadlineWithin(t, "cleanup context", ctx, before, containerdCleanupTimeout+time.Second)
 }
 
 func TestHostNetworkSpecOptsMountNameResolutionFiles(t *testing.T) {
@@ -806,6 +847,42 @@ func TestRemoveContainerUsesBoundedCleanupContext(t *testing.T) {
 		}
 		if deadline.Before(before) || deadline.After(before.Add(containerdCleanupTimeout+time.Second)) {
 			t.Fatalf("expected %s deadline to use cleanup timeout, got %s from start %s", name, deadline, before)
+		}
+	}
+}
+
+func TestRemoveContainerCleanupSurvivesParentCancellation(t *testing.T) {
+	env, cli := newContainerdTestEnvironment(t)
+	task := &fakeTask{}
+	container := &fakeContainer{
+		id:     env.Id,
+		task:   task,
+		labels: map[string]string{},
+	}
+	cli.container = container
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	if err := env.removeContainer(parent); err != nil {
+		t.Fatalf("removeContainer() returned error: %v", err)
+	}
+
+	for name, ctx := range map[string]context.Context{
+		"load container":   cli.loadCtx,
+		"task delete":      task.deleteCtx,
+		"container delete": container.deleteCtx,
+	} {
+		if ctx == nil {
+			t.Fatalf("expected %s to receive a context", name)
+		}
+	}
+	for name, err := range map[string]error{
+		"load container":   cli.loadCtxErr,
+		"task delete":      task.deleteCtxErr,
+		"container delete": container.deleteCtxErr,
+	} {
+		if err != nil {
+			t.Fatalf("expected %s context to ignore parent cancellation at call time, got %v", name, err)
 		}
 	}
 }
@@ -1402,6 +1479,69 @@ func TestReadlogCapsRequestedLines(t *testing.T) {
 	}
 }
 
+func TestConsumeOutputContinuesWhenLogWriterFails(t *testing.T) {
+	env, _ := newContainerdTestEnvironment(t)
+	stdoutR, stdoutW := io.Pipe()
+	done := make(chan struct{})
+	var got []string
+	env.SetLogCallback(func(line []byte) {
+		got = append(got, string(line))
+	})
+
+	go func() {
+		defer close(done)
+		env.consumeOutput(stdoutR, failingWriteCloser{err: io.ErrClosedPipe})
+	}()
+
+	if _, err := stdoutW.Write([]byte("first\nsecond\n")); err != nil {
+		t.Fatalf("failed to write stdout: %v", err)
+	}
+	if err := stdoutW.Close(); err != nil {
+		t.Fatalf("failed to close stdout writer: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for consumeOutput to finish")
+	}
+
+	if strings.Join(got, ",") != "first,second" {
+		t.Fatalf("expected both output lines despite log write failure, got %v", got)
+	}
+}
+
+func TestInstallerConsumeOutputContinuesWhenLogWriterFails(t *testing.T) {
+	installer := &Installer{}
+	stdoutR, stdoutW := io.Pipe()
+	done := make(chan struct{})
+	var got []string
+
+	go func() {
+		defer close(done)
+		installer.consumeOutput(stdoutR, failingWriteCloser{err: io.ErrClosedPipe}, func(line []byte) {
+			got = append(got, string(line))
+		})
+	}()
+
+	if _, err := stdoutW.Write([]byte("install-one\ninstall-two\n")); err != nil {
+		t.Fatalf("failed to write stdout: %v", err)
+	}
+	if err := stdoutW.Close(); err != nil {
+		t.Fatalf("failed to close stdout writer: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for installer consumeOutput to finish")
+	}
+
+	if strings.Join(got, ",") != "install-one,install-two" {
+		t.Fatalf("expected installer output despite log write failure, got %v", got)
+	}
+}
+
 func TestContainerdLogPathRejectsUnsafeIdentifier(t *testing.T) {
 	newContainerdTestConfig(t)
 	if _, err := containerdServerLogPath("../escape"); err == nil {
@@ -1586,6 +1726,8 @@ func waitForCondition(t *testing.T, timeout time.Duration, ok func() bool, msg s
 type fakeClient struct {
 	container     containerdclient.Container
 	loadErr       error
+	loadCtx       context.Context
+	loadCtxErr    error
 	loadNamespace string
 
 	newContainerID        string
@@ -1611,6 +1753,8 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) LoadContainer(ctx context.Context, _ string) (containerdclient.Container, error) {
+	f.loadCtx = ctx
+	f.loadCtxErr = ctx.Err()
 	f.loadNamespace = testContainerdNamespace(ctx)
 	if f.loadErr != nil {
 		return nil, f.loadErr
@@ -1692,6 +1836,7 @@ type fakeContainer struct {
 	deleteErr       error
 	deleted         bool
 	deleteCtx       context.Context
+	deleteCtxErr    error
 	deleteNamespace string
 }
 
@@ -1704,6 +1849,7 @@ func (f *fakeContainer) Info(context.Context, ...containerdclient.InfoOpts) (con
 func (f *fakeContainer) Delete(ctx context.Context, _ ...containerdclient.DeleteOpts) error {
 	f.deleted = true
 	f.deleteCtx = ctx
+	f.deleteCtxErr = ctx.Err()
 	f.deleteNamespace = testContainerdNamespace(ctx)
 	return f.deleteErr
 }
@@ -1790,6 +1936,7 @@ type fakeTask struct {
 	startErr             error
 	deleteCalls          int
 	deleteCtx            context.Context
+	deleteCtxErr         error
 	deleteNamespace      string
 	deleteErr            error
 	killed               []syscall.Signal
@@ -1825,6 +1972,7 @@ func (f *fakeTask) Start(ctx context.Context) error {
 func (f *fakeTask) Delete(ctx context.Context, _ ...containerdclient.ProcessDeleteOpts) (*containerdclient.ExitStatus, error) {
 	f.deleteCalls++
 	f.deleteCtx = ctx
+	f.deleteCtxErr = ctx.Err()
 	f.deleteNamespace = testContainerdNamespace(ctx)
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
@@ -2023,6 +2171,18 @@ func (f *fakeSnapshotter) Walk(context.Context, snapshots.WalkFunc, ...string) e
 }
 
 func (f *fakeSnapshotter) Close() error {
+	return nil
+}
+
+type failingWriteCloser struct {
+	err error
+}
+
+func (f failingWriteCloser) Write([]byte) (int, error) {
+	return 0, f.err
+}
+
+func (f failingWriteCloser) Close() error {
 	return nil
 }
 

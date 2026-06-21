@@ -166,6 +166,7 @@ func run() error {
 
 	if err := proc.Destroy(); err != nil {
 		cleanupRoot(*root)
+		cleaned = true
 		return fmt.Errorf("step=cleanup/destroy: %w", err)
 	}
 	cleanupRoot(*root)

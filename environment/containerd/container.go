@@ -29,7 +29,10 @@ const (
 )
 
 func (e *Environment) Exists() (bool, error) {
-	_, err := e.container(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := e.container(ctx)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			return false, nil
